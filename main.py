@@ -1,4 +1,5 @@
 from telethon import TelegramClient, functions, events
+from telethon.sessions import StringSession
 import os
 from dotenv import load_dotenv
 
@@ -6,8 +7,10 @@ load_dotenv()
 
 API_ID = os.getenv('API_ID')
 API_HASH = os.getenv('API_HASH')
+TELEGRAM_STRING_SESSION = os.getenv('TELEGRAM_STRING_SESSION')
 
-client = TelegramClient('main', API_ID, API_HASH)
+client = TelegramClient(StringSession(
+    TELEGRAM_STRING_SESSION), API_ID, API_HASH)
 chat_ids = []
 chat_names = ['FXpro: Delta', 'Oblivion']
 
