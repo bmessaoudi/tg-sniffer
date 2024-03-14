@@ -1,6 +1,4 @@
-FROM python:3.10
-ADD main.py .
-ADD .env .
-ADD requirements.txt . 
-RUN pip install -r requirements.txt
-CMD python ./main.py
+FROM python:3.9.16-slim-buster
+COPY . .
+RUN pip3 install -r requirements.txt
+CMD python main.py
