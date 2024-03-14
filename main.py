@@ -1,8 +1,16 @@
 from telethon import TelegramClient, functions, events
+from telethon.sessions import StringSession
+import os
+from dotenv import load_dotenv
 
-API_ID = "21043880"
-API_HASH = "a2eb61ac67a41d35b1e96d61616da135"
-client = TelegramClient('/root/tg-sniffer/main.session', API_ID, API_HASH)
+load_dotenv()
+
+API_ID = os.getenv('API_ID')
+API_HASH = os.getenv('API_HASH')
+TELEGRAM_STRING_SESSION = os.getenv('TELEGRAM_STRING_SESSION')
+
+client = TelegramClient(StringSession(
+    TELEGRAM_STRING_SESSION), API_ID, API_HASH)
 chat_ids = []
 chat_names = ['FXpro: Delta', 'Oblivion']
 channel_destination = 'IGENIUS 15 DAYS TRIAL'
