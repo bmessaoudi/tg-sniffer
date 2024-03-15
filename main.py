@@ -22,7 +22,7 @@ client = TelegramClient(StringSession(
 chat_ids = []
 # chat_names = ['FXpro: Delta', 'Oblivion']
 chat_names = ['Test crypto botty']
-chat_destination = 'IGENIUS 15 DAYS TRIAL'
+chat_destination = -1002135583752
 
 
 async def main():
