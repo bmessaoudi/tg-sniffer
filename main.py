@@ -31,15 +31,23 @@ async def main():
         logging.info('Bot started')
         await client.start()
 
-        for name in chat_names:
-            logging.info('Search chat ID of: ' + name)
-            result = await client(functions.contacts.SearchRequest(q=name, limit=1))
-            if result.my_results and result.my_results[0].channel_id:
+        async for d in client.iter_dialogs():
+            channelId = d.entity.id
+            channelName = d.name
+            if (channelName in chat_names):
                 logging.info(
-                    'Founded: ' + str(result.my_results[0].channel_id))
-                chat_ids.append(result.my_results[0].channel_id)
-            else:
-                logging.warning('Not founded')
+                    f"Channel id: {channelId}, channel name: {channelName}")
+                chat_ids.append(channelId)
+
+        # for name in chat_names:
+        #     logging.info('Search chat ID of: ' + name)
+        #     result = await client(functions.contacts.SearchRequest(q=name, limit=1))
+        #     if result.my_results and result.my_results[0].channel_id:
+        #         logging.info(
+        #             'Founded: ' + str(result.my_results[0].channel_id))
+        #         chat_ids.append(result.my_results[0].channel_id)
+        #     else:
+        #         logging.warning('Not founded')
 
         @events.register(events.NewMessage(chats=chat_ids))
         async def sniffer(event):
