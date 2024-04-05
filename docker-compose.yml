@@ -2,3 +2,4 @@ version: '3'
 services:
   tg-sniffer:
     image: tg-sniffer:latest
+    restart: 'always'
