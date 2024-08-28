@@ -20,9 +20,8 @@ TELEGRAM_STRING_SESSION = os.getenv('TELEGRAM_STRING_SESSION')
 client = TelegramClient(StringSession(
     TELEGRAM_STRING_SESSION), API_ID, API_HASH)
 chat_ids = []
-chat_names = ['FXpro: Delta']
-# chat_names = ['Test crypto botty']
-chat_destination = -1002135583752
+chat_names = ['FXpro: Athena']
+chat_destination = -1002236481077
 
 
 async def main():
@@ -39,21 +38,11 @@ async def main():
                     f"Channel id: {channelId}, channel name: {channelName}")
                 chat_ids.append(channelId)
 
-        # for name in chat_names:
-        #     logging.info('Search chat ID of: ' + name)
-        #     result = await client(functions.contacts.SearchRequest(q=name, limit=1))
-        #     if result.my_results and result.my_results[0].channel_id:
-        #         logging.info(
-        #             'Founded: ' + str(result.my_results[0].channel_id))
-        #         chat_ids.append(result.my_results[0].channel_id)
-        #     else:
-        #         logging.warning('Not founded')
-
         @events.register(events.NewMessage(chats=chat_ids))
         async def sniffer(event):
             logging.info('MESSAGE EVENT: ' + str(event))
-            message_text = event.message.message
-            await client.send_message(entity=chat_destination, message=message_text)
+            message = event.message
+            await client.send_message(entity=chat_destination, message=message)
 
         client.add_event_handler(sniffer)
 
