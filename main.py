@@ -21,7 +21,7 @@ client = TelegramClient(StringSession(
     TELEGRAM_STRING_SESSION), API_ID, API_HASH)
 chat_ids = []
 chat_names = ['FXpro: Athena']
-chat_destination = -1002236481077
+chat_destination = 2236481077
 
 
 async def main():
