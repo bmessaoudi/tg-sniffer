@@ -20,8 +20,8 @@ TELEGRAM_STRING_SESSION = os.getenv('TELEGRAM_STRING_SESSION')
 client = TelegramClient(StringSession(
     TELEGRAM_STRING_SESSION), API_ID, API_HASH)
 chat_ids = []
-chat_names = ['DR. CRYPTO PUMP 💣', 'TEST TG SNIFFER']
-chat_destination = 2359935049
+chat_names = ['FXpro: Athena']
+chat_destination = 2236481077
 
 
 async def main():
