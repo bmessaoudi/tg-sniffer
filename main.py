@@ -20,7 +20,7 @@ TELEGRAM_STRING_SESSION = os.getenv('TELEGRAM_STRING_SESSION')
 client = TelegramClient(StringSession(
     TELEGRAM_STRING_SESSION), API_ID, API_HASH)
 chat_ids = []
-chat_names = ['CRYPTOcore: Alpha', 'Test crypto botty']
+chat_names = ['CRYPTOcore: Alpha']
 chat_destination = 1912225575
 
 
