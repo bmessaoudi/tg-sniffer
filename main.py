@@ -4,17 +4,66 @@ import os
 from dotenv import load_dotenv
 import logging
 import sys
+from datetime import datetime
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("output.log"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+# =============================================================================
+# PRETTY LOGGER CONFIGURATION
+# =============================================================================
+
+class PrettyFormatter(logging.Formatter):
+    """Custom formatter with colors and better formatting."""
+    
+    # ANSI color codes
+    COLORS = {
+        'DEBUG': '\033[36m',      # Cyan
+        'INFO': '\033[32m',        # Green
+        'WARNING': '\033[33m',     # Yellow
+        'ERROR': '\033[31m',       # Red
+        'CRITICAL': '\033[35m',    # Magenta
+    }
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+    
+    def format(self, record):
+        # Get color for this level
+        color = self.COLORS.get(record.levelname, '')
+        
+        # Format timestamp
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        
+        # Build the formatted message
+        formatted = f"{self.DIM}{timestamp}{self.RESET} "
+        formatted += f"{color}{self.BOLD}[{record.levelname}]{self.RESET} "
+        formatted += f"{record.getMessage()}"
+        
+        return formatted
+
+
+def setup_logger():
+    """Setup logging with pretty console output and file logging."""
+    logger = logging.getLogger('tg-sniffer')
+    logger.setLevel(logging.INFO)
+    
+    # File handler (detailed, no colors)
+    file_handler = logging.FileHandler('output.log')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(message)s'
+    ))
+    
+    # Console handler (pretty, with colors)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(PrettyFormatter())
+    
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+
+logger = setup_logger()
 
 # Load environment variables
 load_dotenv()
@@ -34,6 +83,20 @@ SOURCE_CHANNELS = os.getenv('SOURCE_CHANNELS', '')
 
 # Destination channel ID (required)
 DESTINATION_CHANNEL_ID = os.getenv('DESTINATION_CHANNEL_ID')
+
+# =============================================================================
+# COPY CONTROL - Enable/disable actual message copying
+# =============================================================================
+# Set to 'true' to enable copying, 'false' for dry-run mode (just logging)
+COPY_ENABLED = os.getenv('COPY_ENABLED', 'false').lower() == 'true'
+
+# =============================================================================
+# BLOCKED WORDS - Messages containing these words will NOT be copied
+# =============================================================================
+# Comma-separated list of words/phrases that block message copying
+# Example: "zoom.us,meet.google.com,teams.microsoft.com"
+BLOCKED_WORDS_RAW = os.getenv('BLOCKED_WORDS', '')
+BLOCKED_WORDS = [word.strip().lower() for word in BLOCKED_WORDS_RAW.split(',') if word.strip()]
 
 # =============================================================================
 # VALIDATION
@@ -88,12 +151,28 @@ async def main():
     source_channel_config = parse_source_channels()
     destination_id = int(DESTINATION_CHANNEL_ID)
     
-    logger.info("=" * 60)
-    logger.info("TELEGRAM CHANNEL COPIER")
-    logger.info("=" * 60)
-    logger.info(f"Source channels configured: {source_channel_config}")
-    logger.info(f"Destination channel ID: {destination_id}")
-    logger.info("=" * 60)
+    logger.info("")
+    logger.info("╔" + "═" * 58 + "╗")
+    logger.info("║" + "  📡 TELEGRAM CHANNEL COPIER".ljust(58) + "║")
+    logger.info("╠" + "═" * 58 + "╣")
+    logger.info("║" + f"  Source: {source_channel_config}"[:57].ljust(58) + "║")
+    logger.info("║" + f"  Destination: {destination_id}".ljust(58) + "║")
+    logger.info("╠" + "═" * 58 + "╣")
+    
+    # Show copy status
+    if COPY_ENABLED:
+        logger.info("║" + "  ✅ COPY MODE: ENABLED (messages will be copied)".ljust(58) + "║")
+    else:
+        logger.info("║" + "  ⏸️  COPY MODE: DISABLED (dry-run, just logging)".ljust(58) + "║")
+    
+    # Show blocked words
+    if BLOCKED_WORDS:
+        logger.info("║" + f"  🚫 Blocked words: {', '.join(BLOCKED_WORDS[:3])}{'...' if len(BLOCKED_WORDS) > 3 else ''}".ljust(58) + "║")
+    else:
+        logger.info("║" + "  🚫 Blocked words: (none configured)".ljust(58) + "║")
+    
+    logger.info("╚" + "═" * 58 + "╝")
+    logger.info("")
     
     # Initialize client
     client = TelegramClient(
@@ -132,14 +211,40 @@ async def main():
                 message = event.message
                 sender_chat = await event.get_chat()
                 
-                logger.info(f"New message from '{sender_chat.title}': {message.text[:100] if message.text else '[Media/No text]'}...")
+                # Get message preview (first 50 chars)
+                text = message.text or ''
+                preview = text[:50].replace('\n', ' ') if text else '[Media/No text]'
+                if len(text) > 50:
+                    preview += '...'
+                
+                # Pretty log the incoming message
+                logger.info(f"{'─' * 50}")
+                logger.info(f"📨 NEW MESSAGE")
+                logger.info(f"   From: {sender_chat.title}")
+                logger.info(f"   Preview: {preview}")
+                
+                # Check for blocked words
+                if BLOCKED_WORDS:
+                    message_lower = text.lower()
+                    for blocked_word in BLOCKED_WORDS:
+                        if blocked_word in message_lower:
+                            logger.warning(f"   ⛔ BLOCKED - Contains: '{blocked_word}'")
+                            logger.info(f"{'─' * 50}")
+                            return
+                
+                # Check if copy is enabled
+                if not COPY_ENABLED:
+                    logger.info(f"   ⏸️  DRY-RUN MODE - Message NOT copied")
+                    logger.info(f"{'─' * 50}")
+                    return
                 
                 # Forward the message to destination
                 await client.send_message(entity=destination_id, message=message)
-                logger.info(f"✓ Message forwarded to destination channel")
+                logger.info(f"   ✅ COPIED to destination")
+                logger.info(f"{'─' * 50}")
                 
             except Exception as e:
-                logger.error(f"Error forwarding message: {e}")
+                logger.error(f"❌ Error forwarding message: {e}")
         
         logger.info("=" * 60)
         logger.info("Bot is now running and listening for messages...")
