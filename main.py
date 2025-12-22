@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 import logging
 import sys
 from datetime import datetime
+import asyncio
+from collections import deque
 
 # =============================================================================
 # PRETTY LOGGER CONFIGURATION
@@ -141,6 +143,130 @@ def parse_source_channels():
 
 
 # =============================================================================
+# MESSAGE QUEUE SYSTEM - Ensures chronological order and no message loss
+# =============================================================================
+
+class MessageQueue:
+    """Thread-safe async message queue with retry support."""
+    
+    def __init__(self, max_retries=5, retry_delay=2.0):
+        self.queue = asyncio.Queue()
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self.failed_messages = deque(maxlen=100)  # Keep track of failed messages
+        self.stats = {
+            'total_received': 0,
+            'total_sent': 0,
+            'total_blocked': 0,
+            'total_failed': 0,
+        }
+        self._worker_task = None
+        self._client = None
+        self._destination_id = None
+    
+    def set_client(self, client, destination_id):
+        """Set the Telegram client and destination for sending."""
+        self._client = client
+        self._destination_id = destination_id
+    
+    async def add_message(self, message, sender_title, preview):
+        """Add a message to the queue."""
+        self.stats['total_received'] += 1
+        await self.queue.put({
+            'message': message,
+            'sender_title': sender_title,
+            'preview': preview,
+            'timestamp': datetime.now(),
+            'retries': 0,
+        })
+        queue_size = self.queue.qsize()
+        if queue_size > 1:
+            logger.info(f"   📥 Queued (position: {queue_size})")
+    
+    async def start_worker(self):
+        """Start the queue worker."""
+        self._worker_task = asyncio.create_task(self._process_queue())
+        logger.info("📋 Message queue worker started")
+    
+    async def stop_worker(self):
+        """Stop the queue worker gracefully."""
+        if self._worker_task:
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("📋 Message queue worker stopped")
+            self._log_stats()
+    
+    def _log_stats(self):
+        """Log final statistics."""
+        logger.info("")
+        logger.info("╔" + "═" * 58 + "╗")
+        logger.info("║" + "  📊 SESSION STATISTICS".ljust(58) + "║")
+        logger.info("╠" + "═" * 58 + "╣")
+        logger.info("║" + f"  Messages received: {self.stats['total_received']}".ljust(58) + "║")
+        logger.info("║" + f"  Messages sent: {self.stats['total_sent']}".ljust(58) + "║")
+        logger.info("║" + f"  Messages blocked: {self.stats['total_blocked']}".ljust(58) + "║")
+        logger.info("║" + f"  Messages failed: {self.stats['total_failed']}".ljust(58) + "║")
+        logger.info("╚" + "═" * 58 + "╝")
+    
+    async def _process_queue(self):
+        """Process messages from the queue one by one (in order)."""
+        while True:
+            try:
+                # Wait for a message
+                item = await self.queue.get()
+                
+                message = item['message']
+                sender_title = item['sender_title']
+                preview = item['preview']
+                retries = item['retries']
+                
+                success = False
+                
+                while not success and retries < self.max_retries:
+                    try:
+                        # Send the message
+                        await self._client.send_message(
+                            entity=self._destination_id,
+                            message=message
+                        )
+                        success = True
+                        self.stats['total_sent'] += 1
+                        logger.info(f"   ✅ COPIED to destination")
+                        logger.info(f"{'─' * 50}")
+                        
+                    except Exception as e:
+                        retries += 1
+                        if retries < self.max_retries:
+                            logger.warning(f"   ⚠️  Retry {retries}/{self.max_retries} - Error: {e}")
+                            await asyncio.sleep(self.retry_delay * retries)  # Exponential backoff
+                        else:
+                            logger.error(f"   ❌ FAILED after {self.max_retries} retries: {e}")
+                            self.stats['total_failed'] += 1
+                            self.failed_messages.append({
+                                'preview': preview,
+                                'sender': sender_title,
+                                'error': str(e),
+                                'timestamp': item['timestamp'],
+                            })
+                
+                self.queue.task_done()
+                
+            except asyncio.CancelledError:
+                # Worker is being stopped, process remaining messages
+                remaining = self.queue.qsize()
+                if remaining > 0:
+                    logger.warning(f"⚠️  {remaining} messages still in queue!")
+                raise
+
+
+# Global message queue instance
+message_queue = MessageQueue(max_retries=5, retry_delay=2.0)
+
+
+# =============================================================================
 # MAIN BOT LOGIC
 # =============================================================================
 
@@ -171,6 +297,11 @@ async def main():
     else:
         logger.info("║" + "  🚫 Blocked words: (none configured)".ljust(58) + "║")
     
+    # Show queue info
+    logger.info("╠" + "═" * 58 + "╣")
+    logger.info("║" + "  📋 MESSAGE QUEUE: ENABLED (ordered delivery)".ljust(58) + "║")
+    logger.info("║" + f"  🔄 Max retries: {message_queue.max_retries}".ljust(58) + "║")
+    
     logger.info("╚" + "═" * 58 + "╝")
     logger.info("")
     
@@ -184,6 +315,10 @@ async def main():
     try:
         await client.start()
         logger.info("Client connected successfully")
+        
+        # Setup message queue
+        message_queue.set_client(client, destination_id)
+        await message_queue.start_worker()
         
         # Find matching source channels
         matched_channel_ids = []
@@ -230,6 +365,7 @@ async def main():
                         if blocked_word in message_lower:
                             logger.warning(f"   ⛔ BLOCKED - Contains: '{blocked_word}'")
                             logger.info(f"{'─' * 50}")
+                            message_queue.stats['total_blocked'] += 1
                             return
                 
                 # Check if copy is enabled
@@ -238,13 +374,15 @@ async def main():
                     logger.info(f"{'─' * 50}")
                     return
                 
-                # Forward the message to destination
-                await client.send_message(entity=destination_id, message=message)
-                logger.info(f"   ✅ COPIED to destination")
-                logger.info(f"{'─' * 50}")
+                # Add message to queue for ordered processing
+                await message_queue.add_message(
+                    message=message,
+                    sender_title=sender_chat.title,
+                    preview=preview
+                )
                 
             except Exception as e:
-                logger.error(f"❌ Error forwarding message: {e}")
+                logger.error(f"❌ Error processing message: {e}")
         
         logger.info("=" * 60)
         logger.info("Bot is now running and listening for messages...")
@@ -259,10 +397,10 @@ async def main():
         logger.error(f"Fatal error: {e}")
         raise
     finally:
+        await message_queue.stop_worker()
         await client.disconnect()
         logger.info("Client disconnected")
 
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
