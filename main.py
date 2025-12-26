@@ -174,7 +174,7 @@ class MessageQueue:
         self._destination_id = destination_id
         self._message_mapper = message_mapper
     
-    async def add_message(self, message, sender_title, preview, source_channel_id):
+    async def add_message(self, message, sender_title, preview, source_channel_id, reply_to_dest_id=None):
         """Add a message to the queue."""
         self.stats['total_received'] += 1
         await self.queue.put({
@@ -182,6 +182,7 @@ class MessageQueue:
             'sender_title': sender_title,
             'preview': preview,
             'source_channel_id': source_channel_id,
+            'reply_to_dest_id': reply_to_dest_id,
             'timestamp': datetime.now(),
             'retries': 0,
         })
@@ -230,16 +231,18 @@ class MessageQueue:
                 source_channel_id = item['source_channel_id']
                 sender_title = item['sender_title']
                 preview = item['preview']
+                reply_to_dest_id = item.get('reply_to_dest_id')
                 retries = item['retries']
                 
                 success = False
                 
                 while not success and retries < self.max_retries:
                     try:
-                        # Send the message
+                        # Send the message (with reply_to if applicable)
                         sent_message = await self._client.send_message(
                             entity=self._destination_id,
-                            message=message
+                            message=message,
+                            reply_to=reply_to_dest_id
                         )
                         success = True
                         self.stats['total_sent'] += 1
@@ -339,7 +342,7 @@ async def main():
         await message_mapper.init_db()
         
         # Run initial cleanup
-        await message_mapper.cleanup_old(days=5)
+        await message_mapper.cleanup_old(days=10)
         
         # Setup message queue with database
         message_queue.set_client(client, destination_id, message_mapper)
@@ -351,7 +354,7 @@ async def main():
             while True:
                 await asyncio.sleep(86400)  # 24 hours
                 try:
-                    deleted_count = await message_mapper.cleanup_old(days=5)
+                    deleted_count = await message_mapper.cleanup_old(days=10)
                     if deleted_count > 0:
                         logger.info(f"🧹 Daily cleanup completed: {deleted_count} old mappings removed")
                 except Exception as e:
@@ -413,12 +416,26 @@ async def main():
                     logger.info(f"{'─' * 50}")
                     return
                 
+                # Check if this message is a reply to another message
+                reply_to_dest_id = None
+                if message.reply_to_msg_id:
+                    # Look up the destination message ID for the replied message
+                    reply_to_dest_id = await message_mapper.get_destination_id(
+                        source_msg_id=message.reply_to_msg_id,
+                        source_channel_id=sender_chat.id
+                    )
+                    if reply_to_dest_id:
+                        logger.info(f"   ↩️  Reply to message #{message.reply_to_msg_id} → #{reply_to_dest_id}")
+                    else:
+                        logger.info(f"   ↩️  Reply to message #{message.reply_to_msg_id} (original not found)")
+                
                 # Add message to queue for ordered processing
                 await message_queue.add_message(
                     message=message,
                     sender_title=sender_chat.title,
                     preview=preview,
-                    source_channel_id=sender_chat.id
+                    source_channel_id=sender_chat.id,
+                    reply_to_dest_id=reply_to_dest_id
                 )
                 
             except Exception as e:
