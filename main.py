@@ -5,6 +5,9 @@ from dotenv import load_dotenv
 import logging
 import sys
 from datetime import datetime
+import asyncio
+from collections import deque
+from database import MessageMapper
 
 # =============================================================================
 # PRETTY LOGGER CONFIGURATION
@@ -141,6 +144,150 @@ def parse_source_channels():
 
 
 # =============================================================================
+# MESSAGE QUEUE SYSTEM - Ensures chronological order and no message loss
+# =============================================================================
+
+class MessageQueue:
+    """Thread-safe async message queue with retry support."""
+    
+    def __init__(self, max_retries=5, retry_delay=2.0):
+        self.queue = asyncio.Queue()
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self.failed_messages = deque(maxlen=100)  # Keep track of failed messages
+        self.stats = {
+            'total_received': 0,
+            'total_sent': 0,
+            'total_blocked': 0,
+            'total_failed': 0,
+            'total_edited': 0,
+            'total_deleted': 0,
+        }
+        self._worker_task = None
+        self._client = None
+        self._destination_id = None
+        self._message_mapper = None
+    
+    def set_client(self, client, destination_id, message_mapper=None):
+        """Set the Telegram client, destination, and message mapper."""
+        self._client = client
+        self._destination_id = destination_id
+        self._message_mapper = message_mapper
+    
+    async def add_message(self, message, sender_title, preview, source_channel_id, reply_to_dest_id=None):
+        """Add a message to the queue."""
+        self.stats['total_received'] += 1
+        await self.queue.put({
+            'message': message,
+            'sender_title': sender_title,
+            'preview': preview,
+            'source_channel_id': source_channel_id,
+            'reply_to_dest_id': reply_to_dest_id,
+            'timestamp': datetime.now(),
+            'retries': 0,
+        })
+        queue_size = self.queue.qsize()
+        if queue_size > 1:
+            logger.info(f"   📥 Queued (position: {queue_size})")
+    
+    async def start_worker(self):
+        """Start the queue worker."""
+        self._worker_task = asyncio.create_task(self._process_queue())
+        logger.info("📋 Message queue worker started")
+    
+    async def stop_worker(self):
+        """Stop the queue worker gracefully."""
+        if self._worker_task:
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("📋 Message queue worker stopped")
+            self._log_stats()
+    
+    def _log_stats(self):
+        """Log final statistics."""
+        logger.info("")
+        logger.info("╔" + "═" * 58 + "╗")
+        logger.info("║" + "  📊 SESSION STATISTICS".ljust(58) + "║")
+        logger.info("╠" + "═" * 58 + "╣")
+        logger.info("║" + f"  Messages received: {self.stats['total_received']}".ljust(58) + "║")
+        logger.info("║" + f"  Messages sent: {self.stats['total_sent']}".ljust(58) + "║")
+        logger.info("║" + f"  Messages edited: {self.stats['total_edited']}".ljust(58) + "║")
+        logger.info("║" + f"  Messages deleted: {self.stats['total_deleted']}".ljust(58) + "║")
+        logger.info("║" + f"  Messages blocked: {self.stats['total_blocked']}".ljust(58) + "║")
+        logger.info("║" + f"  Messages failed: {self.stats['total_failed']}".ljust(58) + "║")
+        logger.info("╚" + "═" * 58 + "╝")
+    
+    async def _process_queue(self):
+        """Process messages from the queue one by one (in order)."""
+        while True:
+            try:
+                # Wait for a message
+                item = await self.queue.get()
+                
+                message = item['message']
+                source_channel_id = item['source_channel_id']
+                sender_title = item['sender_title']
+                preview = item['preview']
+                reply_to_dest_id = item.get('reply_to_dest_id')
+                retries = item['retries']
+                
+                success = False
+                
+                while not success and retries < self.max_retries:
+                    try:
+                        # Send the message (with reply_to if applicable)
+                        sent_message = await self._client.send_message(
+                            entity=self._destination_id,
+                            message=message,
+                            reply_to=reply_to_dest_id
+                        )
+                        success = True
+                        self.stats['total_sent'] += 1
+                        
+                        # Save mapping to database
+                        if self._message_mapper and sent_message:
+                            await self._message_mapper.add_mapping(
+                                source_msg_id=message.id,
+                                destination_msg_id=sent_message.id,
+                                source_channel_id=source_channel_id
+                            )
+                        
+                        logger.info(f"   ✅ COPIED to destination")
+                        logger.info(f"{'─' * 50}")
+                        
+                    except Exception as e:
+                        retries += 1
+                        if retries < self.max_retries:
+                            logger.warning(f"   ⚠️  Retry {retries}/{self.max_retries} - Error: {e}")
+                            await asyncio.sleep(self.retry_delay * retries)  # Exponential backoff
+                        else:
+                            logger.error(f"   ❌ FAILED after {self.max_retries} retries: {e}")
+                            self.stats['total_failed'] += 1
+                            self.failed_messages.append({
+                                'preview': preview,
+                                'sender': sender_title,
+                                'error': str(e),
+                                'timestamp': item['timestamp'],
+                            })
+                
+                self.queue.task_done()
+                
+            except asyncio.CancelledError:
+                # Worker is being stopped, process remaining messages
+                remaining = self.queue.qsize()
+                if remaining > 0:
+                    logger.warning(f"⚠️  {remaining} messages still in queue!")
+                raise
+
+
+# Global message queue instance
+message_queue = MessageQueue(max_retries=5, retry_delay=2.0)
+
+
+# =============================================================================
 # MAIN BOT LOGIC
 # =============================================================================
 
@@ -171,6 +318,11 @@ async def main():
     else:
         logger.info("║" + "  🚫 Blocked words: (none configured)".ljust(58) + "║")
     
+    # Show queue info
+    logger.info("╠" + "═" * 58 + "╣")
+    logger.info("║" + "  📋 MESSAGE QUEUE: ENABLED (ordered delivery)".ljust(58) + "║")
+    logger.info("║" + f"  🔄 Max retries: {message_queue.max_retries}".ljust(58) + "║")
+    
     logger.info("╚" + "═" * 58 + "╝")
     logger.info("")
     
@@ -184,6 +336,31 @@ async def main():
     try:
         await client.start()
         logger.info("Client connected successfully")
+        
+        # Initialize message mapper (database)
+        message_mapper = MessageMapper('messages.db')
+        await message_mapper.init_db()
+        
+        # Run initial cleanup
+        await message_mapper.cleanup_old(days=10)
+        
+        # Setup message queue with database
+        message_queue.set_client(client, destination_id, message_mapper)
+        await message_queue.start_worker()
+        
+        # Start daily cleanup task
+        async def daily_cleanup():
+            """Run cleanup every 24 hours."""
+            while True:
+                await asyncio.sleep(86400)  # 24 hours
+                try:
+                    deleted_count = await message_mapper.cleanup_old(days=10)
+                    if deleted_count > 0:
+                        logger.info(f"🧹 Daily cleanup completed: {deleted_count} old mappings removed")
+                except Exception as e:
+                    logger.error(f"❌ Daily cleanup failed: {e}")
+        
+        cleanup_task = asyncio.create_task(daily_cleanup())
         
         # Find matching source channels
         matched_channel_ids = []
@@ -230,6 +407,7 @@ async def main():
                         if blocked_word in message_lower:
                             logger.warning(f"   ⛔ BLOCKED - Contains: '{blocked_word}'")
                             logger.info(f"{'─' * 50}")
+                            message_queue.stats['total_blocked'] += 1
                             return
                 
                 # Check if copy is enabled
@@ -238,13 +416,146 @@ async def main():
                     logger.info(f"{'─' * 50}")
                     return
                 
-                # Forward the message to destination
-                await client.send_message(entity=destination_id, message=message)
-                logger.info(f"   ✅ COPIED to destination")
+                # Check if this message is a reply to another message
+                reply_to_dest_id = None
+                if message.reply_to_msg_id:
+                    # Look up the destination message ID for the replied message
+                    reply_to_dest_id = await message_mapper.get_destination_id(
+                        source_msg_id=message.reply_to_msg_id,
+                        source_channel_id=sender_chat.id
+                    )
+                    if reply_to_dest_id:
+                        logger.info(f"   ↩️  Reply to message #{message.reply_to_msg_id} → #{reply_to_dest_id}")
+                    else:
+                        logger.info(f"   ↩️  Reply to message #{message.reply_to_msg_id} (original not found)")
+                
+                # Add message to queue for ordered processing
+                await message_queue.add_message(
+                    message=message,
+                    sender_title=sender_chat.title,
+                    preview=preview,
+                    source_channel_id=sender_chat.id,
+                    reply_to_dest_id=reply_to_dest_id
+                )
+                
+            except Exception as e:
+                logger.error(f"❌ Error processing message: {e}")
+        
+        # Register message edit handler
+        @client.on(events.MessageEdited(chats=matched_channel_ids))
+        async def edit_handler(event):
+            """Handle message edits in source channels."""
+            try:
+                if not COPY_ENABLED:
+                    return
+                
+                message = event.message
+                sender_chat = await event.get_chat()
+                
+                # Get destination message ID from database
+                destination_msg_id = await message_mapper.get_destination_id(
+                    source_msg_id=message.id,
+                    source_channel_id=sender_chat.id
+                )
+                
+                if not destination_msg_id:
+                    logger.debug(f"No mapping found for edited message {message.id}")
+                    return
+                
+                # Get message preview
+                text = message.text or ''
+                preview = text[:50].replace('\n', ' ') if text else '[Media/No text]'
+                if len(text) > 50:
+                    preview += '...'
+                
+                # Edit the message in destination
+                await client.edit_message(
+                    entity=destination_id,
+                    message=destination_msg_id,
+                    text=message.text
+                )
+                
+                message_queue.stats['total_edited'] += 1
+                logger.info(f"{'─' * 50}")
+                logger.info(f"✏️  MESSAGE EDITED")
+                logger.info(f"   From: {sender_chat.title}")
+                logger.info(f"   Preview: {preview}")
+                logger.info(f"   ✅ EDIT synced to destination")
                 logger.info(f"{'─' * 50}")
                 
             except Exception as e:
-                logger.error(f"❌ Error forwarding message: {e}")
+                logger.error(f"❌ Error handling message edit: {e}")
+        
+        # Register message delete handler
+        @client.on(events.MessageDeleted())
+        async def delete_handler(event):
+            """Handle message deletions in source channels."""
+            try:
+                if not COPY_ENABLED:
+                    return
+                
+                # Get deleted message IDs
+                deleted_ids = event.deleted_ids
+                
+                # Check if we have a channel_id (needed for our mappings)
+                # For channel messages, we can get the channel_id
+                channel_id = None
+                if hasattr(event, 'chat_id') and event.chat_id:
+                    channel_id = event.chat_id
+                elif hasattr(event, 'peer_id') and event.peer_id:
+                    try:
+                        channel_id = event.peer_id.channel_id
+                    except AttributeError:
+                        pass
+                
+                if not channel_id:
+                    # Try to find mappings for any of our monitored channels
+                    for source_channel_id in matched_channel_ids:
+                        dest_ids = await message_mapper.get_destination_ids(
+                            source_msg_ids=deleted_ids,
+                            source_channel_id=source_channel_id
+                        )
+                        if dest_ids:
+                            channel_id = source_channel_id
+                            break
+                
+                if not channel_id or channel_id not in matched_channel_ids:
+                    return
+                
+                # Get destination message IDs from database
+                destination_msg_ids = await message_mapper.get_destination_ids(
+                    source_msg_ids=deleted_ids,
+                    source_channel_id=channel_id
+                )
+                
+                if not destination_msg_ids:
+                    return
+                
+                # Delete messages in destination
+                for dest_id in destination_msg_ids:
+                    try:
+                        await client.delete_messages(
+                            entity=destination_id,
+                            message_ids=[dest_id]
+                        )
+                        message_queue.stats['total_deleted'] += 1
+                    except Exception as e:
+                        logger.error(f"❌ Failed to delete message {dest_id}: {e}")
+                
+                # Remove mappings from database
+                await message_mapper.delete_mappings(
+                    source_msg_ids=deleted_ids,
+                    source_channel_id=channel_id
+                )
+                
+                logger.info(f"{'─' * 50}")
+                logger.info(f"🗑️  MESSAGE(S) DELETED")
+                logger.info(f"   Count: {len(destination_msg_ids)}")
+                logger.info(f"   ✅ DELETE synced to destination")
+                logger.info(f"{'─' * 50}")
+                
+            except Exception as e:
+                logger.error(f"❌ Error handling message deletion: {e}")
         
         logger.info("=" * 60)
         logger.info("Bot is now running and listening for messages...")
@@ -259,10 +570,23 @@ async def main():
         logger.error(f"Fatal error: {e}")
         raise
     finally:
+        # Cancel cleanup task
+        if 'cleanup_task' in locals():
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
+        
+        await message_queue.stop_worker()
+        
+        # Close database
+        if 'message_mapper' in locals():
+            await message_mapper.close()
+        
         await client.disconnect()
         logger.info("Client disconnected")
 
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
