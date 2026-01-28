@@ -8,6 +8,7 @@ from datetime import datetime
 import asyncio
 from collections import deque
 from database import MessageMapper
+from typing import List, Dict
 
 # =============================================================================
 # PRETTY LOGGER CONFIGURATION
@@ -84,8 +85,12 @@ TELEGRAM_STRING_SESSION = os.getenv('TELEGRAM_STRING_SESSION')
 # Example: "Channel Name 1,Channel Name 2" or "1234567890,0987654321"
 SOURCE_CHANNELS = os.getenv('SOURCE_CHANNELS', '')
 
-# Destination channel ID (required)
-DESTINATION_CHANNEL_ID = os.getenv('DESTINATION_CHANNEL_ID')
+# Destination channel IDs - comma-separated list of channel IDs
+# Example: "1234567890,0987654321"
+DESTINATION_CHANNEL_IDS = os.getenv('DESTINATION_CHANNEL_IDS', '')
+
+# Legacy support: single destination channel
+DESTINATION_CHANNEL_ID = os.getenv('DESTINATION_CHANNEL_ID', '')
 
 # =============================================================================
 # COPY CONTROL - Enable/disable actual message copying
@@ -117,8 +122,8 @@ def validate_config():
         errors.append("TELEGRAM_STRING_SESSION is required")
     if not SOURCE_CHANNELS:
         errors.append("SOURCE_CHANNELS is required")
-    if not DESTINATION_CHANNEL_ID:
-        errors.append("DESTINATION_CHANNEL_ID is required")
+    if not DESTINATION_CHANNEL_IDS and not DESTINATION_CHANNEL_ID:
+        errors.append("DESTINATION_CHANNEL_IDS (or legacy DESTINATION_CHANNEL_ID) is required")
     
     if errors:
         for error in errors:
@@ -143,35 +148,56 @@ def parse_source_channels():
     return channels
 
 
+def parse_destination_channels() -> List[int]:
+    """Parse DESTINATION_CHANNEL_IDS into a list of IDs."""
+    channels = []
+    
+    # First try new format (comma-separated list)
+    if DESTINATION_CHANNEL_IDS:
+        for channel in DESTINATION_CHANNEL_IDS.split(','):
+            channel = channel.strip()
+            if channel:
+                try:
+                    channels.append(int(channel))
+                except ValueError:
+                    logger.warning(f"Invalid destination channel ID (must be numeric): {channel}")
+    
+    # Fallback to legacy single destination
+    if not channels and DESTINATION_CHANNEL_ID:
+        try:
+            channels.append(int(DESTINATION_CHANNEL_ID))
+            logger.info("Using legacy DESTINATION_CHANNEL_ID format")
+        except ValueError:
+            logger.error(f"Invalid DESTINATION_CHANNEL_ID: {DESTINATION_CHANNEL_ID}")
+    
+    return channels
+
+
 # =============================================================================
-# MESSAGE QUEUE SYSTEM - Ensures chronological order and no message loss
+# MESSAGE QUEUE SYSTEM - Per-destination queues for ordered delivery
 # =============================================================================
 
-class MessageQueue:
-    """Thread-safe async message queue with retry support."""
+class DestinationQueue:
+    """Queue for a single destination channel with retry support."""
     
-    def __init__(self, max_retries=5, retry_delay=2.0):
+    def __init__(self, destination_id: int, max_retries: int = 5, retry_delay: float = 2.0):
+        self.destination_id = destination_id
         self.queue = asyncio.Queue()
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        self.failed_messages = deque(maxlen=100)  # Keep track of failed messages
+        self.failed_messages = deque(maxlen=100)
         self.stats = {
             'total_received': 0,
             'total_sent': 0,
-            'total_blocked': 0,
             'total_failed': 0,
-            'total_edited': 0,
-            'total_deleted': 0,
         }
         self._worker_task = None
         self._client = None
-        self._destination_id = None
         self._message_mapper = None
     
-    def set_client(self, client, destination_id, message_mapper=None):
-        """Set the Telegram client, destination, and message mapper."""
+    def set_client(self, client, message_mapper=None):
+        """Set the Telegram client and message mapper."""
         self._client = client
-        self._destination_id = destination_id
         self._message_mapper = message_mapper
     
     async def add_message(self, message, sender_title, preview, source_channel_id, reply_to_dest_id=None):
@@ -188,12 +214,12 @@ class MessageQueue:
         })
         queue_size = self.queue.qsize()
         if queue_size > 1:
-            logger.info(f"   📥 Queued (position: {queue_size})")
+            logger.info(f"   📥 Queued for {self.destination_id} (position: {queue_size})")
     
     async def start_worker(self):
         """Start the queue worker."""
         self._worker_task = asyncio.create_task(self._process_queue())
-        logger.info("📋 Message queue worker started")
+        logger.info(f"📋 Queue worker started for destination {self.destination_id}")
     
     async def stop_worker(self):
         """Stop the queue worker gracefully."""
@@ -203,22 +229,6 @@ class MessageQueue:
                 await self._worker_task
             except asyncio.CancelledError:
                 pass
-            logger.info("📋 Message queue worker stopped")
-            self._log_stats()
-    
-    def _log_stats(self):
-        """Log final statistics."""
-        logger.info("")
-        logger.info("╔" + "═" * 58 + "╗")
-        logger.info("║" + "  📊 SESSION STATISTICS".ljust(58) + "║")
-        logger.info("╠" + "═" * 58 + "╣")
-        logger.info("║" + f"  Messages received: {self.stats['total_received']}".ljust(58) + "║")
-        logger.info("║" + f"  Messages sent: {self.stats['total_sent']}".ljust(58) + "║")
-        logger.info("║" + f"  Messages edited: {self.stats['total_edited']}".ljust(58) + "║")
-        logger.info("║" + f"  Messages deleted: {self.stats['total_deleted']}".ljust(58) + "║")
-        logger.info("║" + f"  Messages blocked: {self.stats['total_blocked']}".ljust(58) + "║")
-        logger.info("║" + f"  Messages failed: {self.stats['total_failed']}".ljust(58) + "║")
-        logger.info("╚" + "═" * 58 + "╝")
     
     async def _process_queue(self):
         """Process messages from the queue one by one (in order)."""
@@ -240,7 +250,7 @@ class MessageQueue:
                     try:
                         # Send the message (with reply_to if applicable)
                         sent_message = await self._client.send_message(
-                            entity=self._destination_id,
+                            entity=self.destination_id,
                             message=message,
                             reply_to=reply_to_dest_id
                         )
@@ -252,19 +262,19 @@ class MessageQueue:
                             await self._message_mapper.add_mapping(
                                 source_msg_id=message.id,
                                 destination_msg_id=sent_message.id,
-                                source_channel_id=source_channel_id
+                                source_channel_id=source_channel_id,
+                                destination_channel_id=self.destination_id
                             )
                         
-                        logger.info(f"   ✅ COPIED to destination")
-                        logger.info(f"{'─' * 50}")
+                        logger.info(f"   ✅ COPIED to {self.destination_id}")
                         
                     except Exception as e:
                         retries += 1
                         if retries < self.max_retries:
-                            logger.warning(f"   ⚠️  Retry {retries}/{self.max_retries} - Error: {e}")
-                            await asyncio.sleep(self.retry_delay * retries)  # Exponential backoff
+                            logger.warning(f"   ⚠️  Retry {retries}/{self.max_retries} for {self.destination_id} - Error: {e}")
+                            await asyncio.sleep(self.retry_delay * retries)
                         else:
-                            logger.error(f"   ❌ FAILED after {self.max_retries} retries: {e}")
+                            logger.error(f"   ❌ FAILED for {self.destination_id} after {self.max_retries} retries: {e}")
                             self.stats['total_failed'] += 1
                             self.failed_messages.append({
                                 'preview': preview,
@@ -276,15 +286,79 @@ class MessageQueue:
                 self.queue.task_done()
                 
             except asyncio.CancelledError:
-                # Worker is being stopped, process remaining messages
                 remaining = self.queue.qsize()
                 if remaining > 0:
-                    logger.warning(f"⚠️  {remaining} messages still in queue!")
+                    logger.warning(f"⚠️  {remaining} messages still in queue for {self.destination_id}!")
                 raise
 
 
-# Global message queue instance
-message_queue = MessageQueue(max_retries=5, retry_delay=2.0)
+class MessageQueueManager:
+    """Manages multiple destination queues."""
+    
+    def __init__(self, destination_ids: List[int], max_retries: int = 5, retry_delay: float = 2.0):
+        self.destination_ids = destination_ids
+        self.queues: Dict[int, DestinationQueue] = {
+            dest_id: DestinationQueue(dest_id, max_retries, retry_delay)
+            for dest_id in destination_ids
+        }
+        self.global_stats = {
+            'total_received': 0,
+            'total_blocked': 0,
+            'total_edited': 0,
+            'total_deleted': 0,
+        }
+    
+    def set_client(self, client, message_mapper=None):
+        """Set the Telegram client for all queues."""
+        for queue in self.queues.values():
+            queue.set_client(client, message_mapper)
+    
+    async def broadcast_message(self, message, sender_title, preview, source_channel_id, reply_to_dest_ids: Dict[int, int] = None):
+        """Add a message to all destination queues."""
+        self.global_stats['total_received'] += 1
+        
+        for dest_id, queue in self.queues.items():
+            reply_to_dest_id = reply_to_dest_ids.get(dest_id) if reply_to_dest_ids else None
+            await queue.add_message(
+                message=message,
+                sender_title=sender_title,
+                preview=preview,
+                source_channel_id=source_channel_id,
+                reply_to_dest_id=reply_to_dest_id
+            )
+    
+    async def start_workers(self):
+        """Start all queue workers."""
+        for queue in self.queues.values():
+            await queue.start_worker()
+        logger.info(f"📋 All {len(self.queues)} queue workers started")
+    
+    async def stop_workers(self):
+        """Stop all queue workers."""
+        for queue in self.queues.values():
+            await queue.stop_worker()
+        logger.info("📋 All queue workers stopped")
+        self._log_stats()
+    
+    def _log_stats(self):
+        """Log final statistics."""
+        total_sent = sum(q.stats['total_sent'] for q in self.queues.values())
+        total_failed = sum(q.stats['total_failed'] for q in self.queues.values())
+        
+        logger.info("")
+        logger.info("╔" + "═" * 58 + "╗")
+        logger.info("║" + "  📊 SESSION STATISTICS".ljust(58) + "║")
+        logger.info("╠" + "═" * 58 + "╣")
+        logger.info("║" + f"  Messages received: {self.global_stats['total_received']}".ljust(58) + "║")
+        logger.info("║" + f"  Messages sent (total): {total_sent}".ljust(58) + "║")
+        logger.info("║" + f"  Messages edited: {self.global_stats['total_edited']}".ljust(58) + "║")
+        logger.info("║" + f"  Messages deleted: {self.global_stats['total_deleted']}".ljust(58) + "║")
+        logger.info("║" + f"  Messages blocked: {self.global_stats['total_blocked']}".ljust(58) + "║")
+        logger.info("║" + f"  Messages failed: {total_failed}".ljust(58) + "║")
+        logger.info("╠" + "═" * 58 + "╣")
+        for dest_id, queue in self.queues.items():
+            logger.info("║" + f"  → Dest {dest_id}: {queue.stats['total_sent']} sent, {queue.stats['total_failed']} failed".ljust(58) + "║")
+        logger.info("╚" + "═" * 58 + "╝")
 
 
 # =============================================================================
@@ -296,14 +370,20 @@ async def main():
     validate_config()
     
     source_channel_config = parse_source_channels()
-    destination_id = int(DESTINATION_CHANNEL_ID)
+    destination_ids = parse_destination_channels()
+    
+    if not destination_ids:
+        logger.error("No valid destination channels configured!")
+        sys.exit(1)
     
     logger.info("")
     logger.info("╔" + "═" * 58 + "╗")
     logger.info("║" + "  📡 TELEGRAM CHANNEL COPIER".ljust(58) + "║")
     logger.info("╠" + "═" * 58 + "╣")
     logger.info("║" + f"  Source: {source_channel_config}"[:57].ljust(58) + "║")
-    logger.info("║" + f"  Destination: {destination_id}".ljust(58) + "║")
+    logger.info("║" + f"  Destinations: {len(destination_ids)} channel(s)".ljust(58) + "║")
+    for dest_id in destination_ids:
+        logger.info("║" + f"    → {dest_id}".ljust(58) + "║")
     logger.info("╠" + "═" * 58 + "╣")
     
     # Show copy status
@@ -320,8 +400,8 @@ async def main():
     
     # Show queue info
     logger.info("╠" + "═" * 58 + "╣")
-    logger.info("║" + "  📋 MESSAGE QUEUE: ENABLED (ordered delivery)".ljust(58) + "║")
-    logger.info("║" + f"  🔄 Max retries: {message_queue.max_retries}".ljust(58) + "║")
+    logger.info("║" + f"  📋 MESSAGE QUEUES: {len(destination_ids)} (one per destination)".ljust(58) + "║")
+    logger.info("║" + "  🔄 Max retries: 5".ljust(58) + "║")
     
     logger.info("╚" + "═" * 58 + "╝")
     logger.info("")
@@ -332,6 +412,9 @@ async def main():
         API_ID,
         API_HASH
     )
+    
+    # Initialize message queue manager
+    message_queue_manager = MessageQueueManager(destination_ids, max_retries=5, retry_delay=2.0)
     
     try:
         await client.start()
@@ -344,9 +427,9 @@ async def main():
         # Run initial cleanup
         await message_mapper.cleanup_old(days=10)
         
-        # Setup message queue with database
-        message_queue.set_client(client, destination_id, message_mapper)
-        await message_queue.start_worker()
+        # Setup message queue manager with database
+        message_queue_manager.set_client(client, message_mapper)
+        await message_queue_manager.start_workers()
         
         # Start daily cleanup task
         async def daily_cleanup():
@@ -379,7 +462,7 @@ async def main():
             logger.error("Make sure the account is a member of the specified channels.")
             sys.exit(1)
         
-        logger.info(f"Monitoring {len(matched_channel_ids)} channel(s)")
+        logger.info(f"Monitoring {len(matched_channel_ids)} source channel(s)")
         
         # Register message handler
         @client.on(events.NewMessage(chats=matched_channel_ids))
@@ -407,7 +490,7 @@ async def main():
                         if blocked_word in message_lower:
                             logger.warning(f"   ⛔ BLOCKED - Contains: '{blocked_word}'")
                             logger.info(f"{'─' * 50}")
-                            message_queue.stats['total_blocked'] += 1
+                            message_queue_manager.global_stats['total_blocked'] += 1
                             return
                 
                 # Check if copy is enabled
@@ -417,26 +500,30 @@ async def main():
                     return
                 
                 # Check if this message is a reply to another message
-                reply_to_dest_id = None
+                reply_to_dest_ids = {}
                 if message.reply_to_msg_id:
-                    # Look up the destination message ID for the replied message
-                    reply_to_dest_id = await message_mapper.get_destination_id(
+                    # Look up the destination message IDs for the replied message
+                    mappings = await message_mapper.get_all_destination_mappings(
                         source_msg_id=message.reply_to_msg_id,
                         source_channel_id=sender_chat.id
                     )
-                    if reply_to_dest_id:
-                        logger.info(f"   ↩️  Reply to message #{message.reply_to_msg_id} → #{reply_to_dest_id}")
+                    for dest_msg_id, dest_channel_id in mappings:
+                        reply_to_dest_ids[dest_channel_id] = dest_msg_id
+                    
+                    if reply_to_dest_ids:
+                        logger.info(f"   ↩️  Reply to message #{message.reply_to_msg_id} (found in {len(reply_to_dest_ids)} dest)")
                     else:
                         logger.info(f"   ↩️  Reply to message #{message.reply_to_msg_id} (original not found)")
                 
-                # Add message to queue for ordered processing
-                await message_queue.add_message(
+                # Add message to all destination queues
+                await message_queue_manager.broadcast_message(
                     message=message,
                     sender_title=sender_chat.title,
                     preview=preview,
                     source_channel_id=sender_chat.id,
-                    reply_to_dest_id=reply_to_dest_id
+                    reply_to_dest_ids=reply_to_dest_ids
                 )
+                logger.info(f"{'─' * 50}")
                 
             except Exception as e:
                 logger.error(f"❌ Error processing message: {e}")
@@ -452,13 +539,13 @@ async def main():
                 message = event.message
                 sender_chat = await event.get_chat()
                 
-                # Get destination message ID from database
-                destination_msg_id = await message_mapper.get_destination_id(
+                # Get all destination mappings from database
+                mappings = await message_mapper.get_all_destination_mappings(
                     source_msg_id=message.id,
                     source_channel_id=sender_chat.id
                 )
                 
-                if not destination_msg_id:
+                if not mappings:
                     logger.debug(f"No mapping found for edited message {message.id}")
                     return
                 
@@ -468,19 +555,25 @@ async def main():
                 if len(text) > 50:
                     preview += '...'
                 
-                # Edit the message in destination
-                await client.edit_message(
-                    entity=destination_id,
-                    message=destination_msg_id,
-                    text=message.text
-                )
+                # Edit the message in all destinations
+                edit_count = 0
+                for dest_msg_id, dest_channel_id in mappings:
+                    try:
+                        await client.edit_message(
+                            entity=dest_channel_id,
+                            message=dest_msg_id,
+                            text=message.text
+                        )
+                        edit_count += 1
+                    except Exception as e:
+                        logger.error(f"❌ Failed to edit message {dest_msg_id} in {dest_channel_id}: {e}")
                 
-                message_queue.stats['total_edited'] += 1
+                message_queue_manager.global_stats['total_edited'] += 1
                 logger.info(f"{'─' * 50}")
                 logger.info(f"✏️  MESSAGE EDITED")
                 logger.info(f"   From: {sender_chat.title}")
                 logger.info(f"   Preview: {preview}")
-                logger.info(f"   ✅ EDIT synced to destination")
+                logger.info(f"   ✅ EDIT synced to {edit_count}/{len(mappings)} destinations")
                 logger.info(f"{'─' * 50}")
                 
             except Exception as e:
@@ -498,7 +591,6 @@ async def main():
                 deleted_ids = event.deleted_ids
                 
                 # Check if we have a channel_id (needed for our mappings)
-                # For channel messages, we can get the channel_id
                 channel_id = None
                 if hasattr(event, 'chat_id') and event.chat_id:
                     channel_id = event.chat_id
@@ -511,36 +603,39 @@ async def main():
                 if not channel_id:
                     # Try to find mappings for any of our monitored channels
                     for source_channel_id in matched_channel_ids:
-                        dest_ids = await message_mapper.get_destination_ids(
+                        dest_mappings = await message_mapper.get_destination_ids(
                             source_msg_ids=deleted_ids,
                             source_channel_id=source_channel_id
                         )
-                        if dest_ids:
+                        if dest_mappings:
                             channel_id = source_channel_id
                             break
                 
                 if not channel_id or channel_id not in matched_channel_ids:
                     return
                 
-                # Get destination message IDs from database
-                destination_msg_ids = await message_mapper.get_destination_ids(
+                # Get all destination mappings from database
+                dest_mappings = await message_mapper.get_destination_ids(
                     source_msg_ids=deleted_ids,
                     source_channel_id=channel_id
                 )
                 
-                if not destination_msg_ids:
+                if not dest_mappings:
                     return
                 
-                # Delete messages in destination
-                for dest_id in destination_msg_ids:
+                # Delete messages in all destinations
+                delete_count = 0
+                for dest_msg_id, dest_channel_id in dest_mappings:
                     try:
                         await client.delete_messages(
-                            entity=destination_id,
-                            message_ids=[dest_id]
+                            entity=dest_channel_id,
+                            message_ids=[dest_msg_id]
                         )
-                        message_queue.stats['total_deleted'] += 1
+                        delete_count += 1
                     except Exception as e:
-                        logger.error(f"❌ Failed to delete message {dest_id}: {e}")
+                        logger.error(f"❌ Failed to delete message {dest_msg_id} in {dest_channel_id}: {e}")
+                
+                message_queue_manager.global_stats['total_deleted'] += 1
                 
                 # Remove mappings from database
                 await message_mapper.delete_mappings(
@@ -550,8 +645,8 @@ async def main():
                 
                 logger.info(f"{'─' * 50}")
                 logger.info(f"🗑️  MESSAGE(S) DELETED")
-                logger.info(f"   Count: {len(destination_msg_ids)}")
-                logger.info(f"   ✅ DELETE synced to destination")
+                logger.info(f"   Count: {delete_count}")
+                logger.info(f"   ✅ DELETE synced to all destinations")
                 logger.info(f"{'─' * 50}")
                 
             except Exception as e:
@@ -578,7 +673,7 @@ async def main():
             except asyncio.CancelledError:
                 pass
         
-        await message_queue.stop_worker()
+        await message_queue_manager.stop_workers()
         
         # Close database
         if 'message_mapper' in locals():
