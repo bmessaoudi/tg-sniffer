@@ -1,5 +1,6 @@
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.errors import ChannelPrivateError, UserNotParticipantError, ChatWriteForbiddenError
 import os
 from dotenv import load_dotenv
 import logging
@@ -7,8 +8,9 @@ import sys
 from datetime import datetime
 import asyncio
 from collections import deque
+from dataclasses import dataclass
 from database import MessageMapper
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 # =============================================================================
 # PRETTY LOGGER CONFIGURATION
@@ -174,14 +176,146 @@ def parse_destination_channels() -> List[int]:
 
 
 # =============================================================================
+# DESTINATION CHANNEL VALIDATION
+# =============================================================================
+
+@dataclass
+class ValidatedDestination:
+    """A validated destination channel with cached entity."""
+    channel_id: int
+    entity: object  # Cached Telethon entity
+    title: str
+
+
+async def resolve_destination_entity(client: TelegramClient, channel_id: int) -> Optional[object]:
+    """
+    Attempt to resolve a channel ID to a Telethon entity.
+
+    Tries multiple strategies:
+    1. Direct lookup by ID
+    2. Lookup with -100 prefix (for supergroups/channels)
+    3. Search in user's dialogs
+    """
+    # Strategy 1: Try direct lookup
+    try:
+        entity = await client.get_entity(channel_id)
+        return entity
+    except ValueError:
+        pass  # ID not found, try other strategies
+    except Exception:
+        pass  # Other errors, try other strategies
+
+    # Strategy 2: Try with -100 prefix (supergroups/channels use this format)
+    if channel_id > 0:
+        try:
+            prefixed_id = int(f"-100{channel_id}")
+            entity = await client.get_entity(prefixed_id)
+            return entity
+        except Exception:
+            pass
+
+    # Strategy 3: Search in dialogs
+    try:
+        async for dialog in client.iter_dialogs():
+            if dialog.entity.id == channel_id:
+                return dialog.entity
+    except Exception:
+        pass
+
+    return None
+
+
+async def validate_destination_channels(
+    client: TelegramClient,
+    destination_ids: List[int]
+) -> Dict[int, ValidatedDestination]:
+    """
+    Validate all destination channels at startup.
+
+    Returns a dict mapping channel_id -> ValidatedDestination.
+    Exits with error if any channel cannot be validated.
+    """
+    validated = {}
+    errors = []
+
+    for dest_id in destination_ids:
+        try:
+            entity = await resolve_destination_entity(client, dest_id)
+
+            if entity is None:
+                errors.append(f"  ❌ {dest_id}: Channel not found. Check the ID is correct.")
+                continue
+
+            # Get channel title
+            title = getattr(entity, 'title', None) or getattr(entity, 'username', None) or str(dest_id)
+
+            # Verify we can access the channel (try to get its info)
+            try:
+                # This will fail if we don't have access
+                await client.get_permissions(entity)
+            except ChatWriteForbiddenError:
+                errors.append(f"  ❌ {dest_id} ('{title}'): No permission to post. Bot account must be admin or allowed to post.")
+                continue
+            except UserNotParticipantError:
+                errors.append(f"  ❌ {dest_id} ('{title}'): Not a member of this channel.")
+                continue
+            except ChannelPrivateError:
+                errors.append(f"  ❌ {dest_id} ('{title}'): Private channel - no access.")
+                continue
+            except Exception:
+                # get_permissions might not work for all channel types, that's OK
+                pass
+
+            validated[dest_id] = ValidatedDestination(
+                channel_id=dest_id,
+                entity=entity,
+                title=title
+            )
+            logger.info(f"  ✅ Validated destination: '{title}' (ID: {dest_id})")
+
+        except ChannelPrivateError:
+            errors.append(f"  ❌ {dest_id}: Private channel - no access.")
+        except UserNotParticipantError:
+            errors.append(f"  ❌ {dest_id}: Not a member of this channel.")
+        except Exception as e:
+            errors.append(f"  ❌ {dest_id}: {type(e).__name__}: {e}")
+
+    if errors:
+        logger.error("")
+        logger.error("╔" + "═" * 58 + "╗")
+        logger.error("║" + "  ❌ DESTINATION CHANNEL VALIDATION FAILED".ljust(58) + "║")
+        logger.error("╠" + "═" * 58 + "╣")
+        for error in errors:
+            # Split long error messages
+            if len(error) > 56:
+                logger.error("║" + error[:56].ljust(58) + "║")
+                logger.error("║" + ("    " + error[56:])[:56].ljust(58) + "║")
+            else:
+                logger.error("║" + error.ljust(58) + "║")
+        logger.error("╠" + "═" * 58 + "╣")
+        logger.error("║" + "  Please check:".ljust(58) + "║")
+        logger.error("║" + "  • Channel IDs are correct".ljust(58) + "║")
+        logger.error("║" + "  • Bot account is a member of each channel".ljust(58) + "║")
+        logger.error("║" + "  • Bot account has permission to post".ljust(58) + "║")
+        logger.error("╚" + "═" * 58 + "╝")
+        sys.exit(1)
+
+    return validated
+
+
+# =============================================================================
 # MESSAGE QUEUE SYSTEM - Per-destination queues for ordered delivery
 # =============================================================================
 
 class DestinationQueue:
     """Queue for a single destination channel with retry support."""
-    
-    def __init__(self, destination_id: int, max_retries: int = 5, retry_delay: float = 2.0):
-        self.destination_id = destination_id
+
+    # Fatal errors that should not be retried
+    FATAL_ERRORS = (ChannelPrivateError, UserNotParticipantError, ChatWriteForbiddenError)
+
+    def __init__(self, validated_dest: ValidatedDestination, max_retries: int = 5, retry_delay: float = 2.0):
+        self.validated_dest = validated_dest
+        self.destination_id = validated_dest.channel_id  # Keep for backwards compatibility
         self.queue = asyncio.Queue()
         self.max_retries = max_retries
         self.retry_delay = retry_delay
@@ -248,15 +382,15 @@ class DestinationQueue:
                 
                 while not success and retries < self.max_retries:
                     try:
-                        # Send the message (with reply_to if applicable)
+                        # Send the message using cached entity (with reply_to if applicable)
                         sent_message = await self._client.send_message(
-                            entity=self.destination_id,
+                            entity=self.validated_dest.entity,
                             message=message,
                             reply_to=reply_to_dest_id
                         )
                         success = True
                         self.stats['total_sent'] += 1
-                        
+
                         # Save mapping to database
                         if self._message_mapper and sent_message:
                             await self._message_mapper.add_mapping(
@@ -265,16 +399,29 @@ class DestinationQueue:
                                 source_channel_id=source_channel_id,
                                 destination_channel_id=self.destination_id
                             )
-                        
-                        logger.info(f"   ✅ COPIED to {self.destination_id}")
-                        
+
+                        logger.info(f"   ✅ COPIED to '{self.validated_dest.title}'")
+
+                    except self.FATAL_ERRORS as e:
+                        # Fatal peer errors - don't retry, log and skip
+                        logger.error(f"   ❌ FATAL for '{self.validated_dest.title}': {type(e).__name__} - {e}")
+                        logger.error(f"      This is a configuration/access issue, not retrying.")
+                        self.stats['total_failed'] += 1
+                        self.failed_messages.append({
+                            'preview': preview,
+                            'sender': sender_title,
+                            'error': f"FATAL: {type(e).__name__}: {e}",
+                            'timestamp': item['timestamp'],
+                        })
+                        break  # Exit retry loop for fatal errors
+
                     except Exception as e:
                         retries += 1
                         if retries < self.max_retries:
-                            logger.warning(f"   ⚠️  Retry {retries}/{self.max_retries} for {self.destination_id} - Error: {e}")
+                            logger.warning(f"   ⚠️  Retry {retries}/{self.max_retries} for '{self.validated_dest.title}' - Error: {e}")
                             await asyncio.sleep(self.retry_delay * retries)
                         else:
-                            logger.error(f"   ❌ FAILED for {self.destination_id} after {self.max_retries} retries: {e}")
+                            logger.error(f"   ❌ FAILED for '{self.validated_dest.title}' after {self.max_retries} retries: {e}")
                             self.stats['total_failed'] += 1
                             self.failed_messages.append({
                                 'preview': preview,
@@ -294,12 +441,13 @@ class DestinationQueue:
 
 class MessageQueueManager:
     """Manages multiple destination queues."""
-    
-    def __init__(self, destination_ids: List[int], max_retries: int = 5, retry_delay: float = 2.0):
-        self.destination_ids = destination_ids
+
+    def __init__(self, validated_destinations: Dict[int, ValidatedDestination], max_retries: int = 5, retry_delay: float = 2.0):
+        self.validated_destinations = validated_destinations
+        self.destination_ids = list(validated_destinations.keys())
         self.queues: Dict[int, DestinationQueue] = {
-            dest_id: DestinationQueue(dest_id, max_retries, retry_delay)
-            for dest_id in destination_ids
+            dest_id: DestinationQueue(validated_dest, max_retries, retry_delay)
+            for dest_id, validated_dest in validated_destinations.items()
         }
         self.global_stats = {
             'total_received': 0,
@@ -357,7 +505,8 @@ class MessageQueueManager:
         logger.info("║" + f"  Messages failed: {total_failed}".ljust(58) + "║")
         logger.info("╠" + "═" * 58 + "╣")
         for dest_id, queue in self.queues.items():
-            logger.info("║" + f"  → Dest {dest_id}: {queue.stats['total_sent']} sent, {queue.stats['total_failed']} failed".ljust(58) + "║")
+            title = queue.validated_dest.title[:20] if len(queue.validated_dest.title) > 20 else queue.validated_dest.title
+            logger.info("║" + f"  → {title}: {queue.stats['total_sent']} sent, {queue.stats['total_failed']} failed".ljust(58) + "║")
         logger.info("╚" + "═" * 58 + "╝")
 
 
@@ -412,13 +561,21 @@ async def main():
         API_ID,
         API_HASH
     )
-    
-    # Initialize message queue manager
-    message_queue_manager = MessageQueueManager(destination_ids, max_retries=5, retry_delay=2.0)
-    
+
+    # message_queue_manager will be initialized after destination validation
+    message_queue_manager = None
+
     try:
         await client.start()
         logger.info("Client connected successfully")
+
+        # Validate destination channels before proceeding
+        logger.info("Validating destination channels...")
+        validated_destinations = await validate_destination_channels(client, destination_ids)
+        logger.info(f"All {len(validated_destinations)} destination channel(s) validated successfully")
+
+        # Initialize message queue manager with validated destinations
+        message_queue_manager = MessageQueueManager(validated_destinations, max_retries=5, retry_delay=2.0)
         
         # Initialize message mapper (database)
         message_mapper = MessageMapper('messages.db')
@@ -672,8 +829,9 @@ async def main():
                 await cleanup_task
             except asyncio.CancelledError:
                 pass
-        
-        await message_queue_manager.stop_workers()
+
+        if message_queue_manager is not None:
+            await message_queue_manager.stop_workers()
         
         # Close database
         if 'message_mapper' in locals():
