@@ -10,7 +10,23 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass
 from database import MessageMapper
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
+
+@dataclass
+class Route:
+    """A routing rule: source channel -> list of destination channels, with optional topic filter."""
+    source: Union[int, str]      # Channel ID or name
+    destinations: List[int]      # Destination channel IDs
+    topic_id: Optional[int]      # None = all messages, int = only that forum topic
+
+
+@dataclass
+class ResolvedRoute:
+    """A route with the source resolved to a numeric channel ID."""
+    source_channel_id: int
+    destinations: List[int]
+    topic_id: Optional[int]
+
 
 # =============================================================================
 # PRETTY LOGGER CONFIGURATION
@@ -91,6 +107,10 @@ SOURCE_CHANNELS = os.getenv('SOURCE_CHANNELS', '')
 # Example: "1234567890,0987654321"
 DESTINATION_CHANNEL_IDS = os.getenv('DESTINATION_CHANNEL_IDS', '')
 
+# Per-source routing (advanced, overrides SOURCE_CHANNELS + DESTINATION_CHANNEL_IDS)
+# Format: source->dest1,dest2;source2/topic_id->dest3
+CHANNEL_ROUTES = os.getenv('CHANNEL_ROUTES', '')
+
 # Legacy support: single destination channel
 DESTINATION_CHANNEL_ID = os.getenv('DESTINATION_CHANNEL_ID', '')
 
@@ -122,10 +142,13 @@ def validate_config():
         errors.append("API_HASH is required")
     if not TELEGRAM_STRING_SESSION:
         errors.append("TELEGRAM_STRING_SESSION is required")
-    if not SOURCE_CHANNELS:
-        errors.append("SOURCE_CHANNELS is required")
-    if not DESTINATION_CHANNEL_IDS and not DESTINATION_CHANNEL_ID:
-        errors.append("DESTINATION_CHANNEL_IDS (or legacy DESTINATION_CHANNEL_ID) is required")
+
+    # CHANNEL_ROUTES replaces SOURCE_CHANNELS + DESTINATION_CHANNEL_IDS
+    if not CHANNEL_ROUTES:
+        if not SOURCE_CHANNELS:
+            errors.append("SOURCE_CHANNELS is required (or use CHANNEL_ROUTES)")
+        if not DESTINATION_CHANNEL_IDS and not DESTINATION_CHANNEL_ID:
+            errors.append("DESTINATION_CHANNEL_IDS is required (or use CHANNEL_ROUTES)")
     
     if errors:
         for error in errors:
@@ -173,6 +196,85 @@ def parse_destination_channels() -> List[int]:
             logger.error(f"Invalid DESTINATION_CHANNEL_ID: {DESTINATION_CHANNEL_ID}")
     
     return channels
+
+
+def _parse_channel_routes(raw: str) -> List[Route]:
+    """Parse CHANNEL_ROUTES format: source->dest1,dest2;source/topic->dest3"""
+    routes = []
+    for rule in raw.split(';'):
+        rule = rule.strip()
+        if not rule:
+            continue
+
+        if '->' not in rule:
+            logger.warning(f"Invalid route (missing '->'): {rule}")
+            continue
+
+        source_part, dest_part = rule.split('->', 1)
+        source_part = source_part.strip()
+        dest_part = dest_part.strip()
+
+        if not source_part or not dest_part:
+            logger.warning(f"Invalid route (empty source or destinations): {rule}")
+            continue
+
+        # Parse topic filter: source_id/topic_id
+        topic_id = None
+        if '/' in source_part:
+            source_str, topic_str = source_part.rsplit('/', 1)
+            try:
+                topic_id = int(topic_str)
+                source_part = source_str
+            except ValueError:
+                logger.warning(f"Invalid topic ID '{topic_str}' in route: {rule}")
+                continue
+
+        # Parse source (int or string name)
+        try:
+            source: Union[int, str] = int(source_part)
+        except ValueError:
+            source = source_part
+
+        # Parse destinations (must be numeric IDs)
+        destinations = []
+        for d in dest_part.split(','):
+            d = d.strip()
+            if d:
+                try:
+                    destinations.append(int(d))
+                except ValueError:
+                    logger.warning(f"Invalid destination ID '{d}' in route: {rule}")
+
+        if not destinations:
+            logger.warning(f"No valid destinations in route: {rule}")
+            continue
+
+        routes.append(Route(source=source, destinations=destinations, topic_id=topic_id))
+
+    return routes
+
+
+def parse_routes() -> List[Route]:
+    """
+    Parse routing configuration.
+
+    If CHANNEL_ROUTES is set, parse it for per-source routing.
+    Otherwise, build all-to-all routes from SOURCE_CHANNELS + DESTINATION_CHANNEL_IDS (legacy).
+    """
+    if CHANNEL_ROUTES:
+        routes = _parse_channel_routes(CHANNEL_ROUTES)
+        if routes:
+            logger.info(f"Loaded {len(routes)} route(s) from CHANNEL_ROUTES")
+            return routes
+        logger.warning("CHANNEL_ROUTES set but no valid routes parsed, falling back to legacy config")
+
+    # Legacy: all sources -> all destinations
+    sources = parse_source_channels()
+    destinations = parse_destination_channels()
+    routes = []
+    for src in sources:
+        routes.append(Route(source=src, destinations=list(destinations), topic_id=None))
+    return routes
 
 
 # =============================================================================
@@ -464,7 +566,7 @@ class MessageQueueManager:
     async def broadcast_message(self, message, sender_title, preview, source_channel_id, reply_to_dest_ids: Dict[int, int] = None):
         """Add a message to all destination queues."""
         self.global_stats['total_received'] += 1
-        
+
         for dest_id, queue in self.queues.items():
             reply_to_dest_id = reply_to_dest_ids.get(dest_id) if reply_to_dest_ids else None
             await queue.add_message(
@@ -474,6 +576,22 @@ class MessageQueueManager:
                 source_channel_id=source_channel_id,
                 reply_to_dest_id=reply_to_dest_id
             )
+
+    async def route_message(self, message, sender_title, preview, source_channel_id, destination_ids: List[int], reply_to_dest_ids: Dict[int, int] = None):
+        """Add a message to specific destination queues (per-source routing)."""
+        self.global_stats['total_received'] += 1
+
+        for dest_id in destination_ids:
+            queue = self.queues.get(dest_id)
+            if queue:
+                reply_to_dest_id = reply_to_dest_ids.get(dest_id) if reply_to_dest_ids else None
+                await queue.add_message(
+                    message=message,
+                    sender_title=sender_title,
+                    preview=preview,
+                    source_channel_id=source_channel_id,
+                    reply_to_dest_id=reply_to_dest_id
+                )
     
     async def start_workers(self):
         """Start all queue workers."""
@@ -511,47 +629,81 @@ class MessageQueueManager:
 
 
 # =============================================================================
+# FORUM TOPIC HELPER
+# =============================================================================
+
+def get_topic_id_from_message(message) -> Optional[int]:
+    """
+    Extract the forum topic ID from a message, if any.
+
+    In Telethon, forum messages have message.reply_to with forum_topic=True.
+    The topic ID is reply_to.reply_to_top_id (for replies within a topic)
+    or reply_to.reply_to_msg_id (for the first message in a topic thread).
+    Returns None for non-forum messages.
+    """
+    reply_to = getattr(message, 'reply_to', None)
+    if reply_to is None:
+        return None
+    if not getattr(reply_to, 'forum_topic', False):
+        return None
+    # reply_to_top_id is set for replies within a topic thread
+    top_id = getattr(reply_to, 'reply_to_top_id', None)
+    if top_id is not None:
+        return top_id
+    # Otherwise, reply_to_msg_id points to the topic service message
+    return getattr(reply_to, 'reply_to_msg_id', None)
+
+
+# =============================================================================
 # MAIN BOT LOGIC
 # =============================================================================
 
 async def main():
     """Main bot function."""
     validate_config()
-    
-    source_channel_config = parse_source_channels()
-    destination_ids = parse_destination_channels()
-    
+
+    routes = parse_routes()
+    if not routes:
+        logger.error("No valid routes configured!")
+        sys.exit(1)
+
+    # Collect all unique destination IDs across all routes
+    destination_ids = list({d for route in routes for d in route.destinations})
+
     if not destination_ids:
         logger.error("No valid destination channels configured!")
         sys.exit(1)
-    
+
     logger.info("")
     logger.info("╔" + "═" * 58 + "╗")
     logger.info("║" + "  📡 TELEGRAM CHANNEL COPIER".ljust(58) + "║")
     logger.info("╠" + "═" * 58 + "╣")
-    logger.info("║" + f"  Source: {source_channel_config}"[:57].ljust(58) + "║")
-    logger.info("║" + f"  Destinations: {len(destination_ids)} channel(s)".ljust(58) + "║")
-    for dest_id in destination_ids:
-        logger.info("║" + f"    → {dest_id}".ljust(58) + "║")
+    logger.info("║" + f"  Routes: {len(routes)} configured".ljust(58) + "║")
+    for route in routes:
+        topic_str = f"/topic:{route.topic_id}" if route.topic_id else ""
+        dest_str = ",".join(str(d) for d in route.destinations)
+        line = f"    {route.source}{topic_str} -> {dest_str}"
+        logger.info("║" + line[:56].ljust(58) + "║")
+    logger.info("║" + f"  Destinations: {len(destination_ids)} unique channel(s)".ljust(58) + "║")
     logger.info("╠" + "═" * 58 + "╣")
-    
+
     # Show copy status
     if COPY_ENABLED:
         logger.info("║" + "  ✅ COPY MODE: ENABLED (messages will be copied)".ljust(58) + "║")
     else:
         logger.info("║" + "  ⏸️  COPY MODE: DISABLED (dry-run, just logging)".ljust(58) + "║")
-    
+
     # Show blocked words
     if BLOCKED_WORDS:
         logger.info("║" + f"  🚫 Blocked words: {', '.join(BLOCKED_WORDS[:3])}{'...' if len(BLOCKED_WORDS) > 3 else ''}".ljust(58) + "║")
     else:
         logger.info("║" + "  🚫 Blocked words: (none configured)".ljust(58) + "║")
-    
+
     # Show queue info
     logger.info("╠" + "═" * 58 + "╣")
     logger.info("║" + f"  📋 MESSAGE QUEUES: {len(destination_ids)} (one per destination)".ljust(58) + "║")
     logger.info("║" + "  🔄 Max retries: 5".ljust(58) + "║")
-    
+
     logger.info("╚" + "═" * 58 + "╝")
     logger.info("")
     
@@ -602,24 +754,49 @@ async def main():
         
         cleanup_task = asyncio.create_task(daily_cleanup())
         
-        # Find matching source channels
-        matched_channel_ids = []
-        
+        # Build routing table: resolve source names/IDs to actual channel IDs
+        # routing_table: {source_channel_id: [ResolvedRoute, ...]}
+        routing_table: Dict[int, List[ResolvedRoute]] = {}
+
+        # Collect all source identifiers we need to resolve
+        source_identifiers = {route.source for route in routes}
+
+        # Map source identifier -> resolved channel ID
+        resolved_sources: Dict[Union[int, str], int] = {}
+
         async for dialog in client.iter_dialogs():
             channel_id = dialog.entity.id
             channel_name = dialog.name
-            
-            # Match by ID or by name
-            if channel_id in source_channel_config or channel_name in source_channel_config:
+
+            if channel_id in source_identifiers:
+                resolved_sources[channel_id] = channel_id
                 logger.info(f"✓ Matched source channel: '{channel_name}' (ID: {channel_id})")
-                matched_channel_ids.append(channel_id)
-        
+            elif channel_name in source_identifiers:
+                resolved_sources[channel_name] = channel_id
+                logger.info(f"✓ Matched source channel: '{channel_name}' (ID: {channel_id})")
+
+        # Build the routing table from resolved routes
+        for route in routes:
+            src_id = resolved_sources.get(route.source)
+            if src_id is None:
+                logger.warning(f"Source '{route.source}' not found in dialogs, skipping route")
+                continue
+
+            resolved = ResolvedRoute(
+                source_channel_id=src_id,
+                destinations=route.destinations,
+                topic_id=route.topic_id
+            )
+            routing_table.setdefault(src_id, []).append(resolved)
+
+        matched_channel_ids = list(routing_table.keys())
+
         if not matched_channel_ids:
-            logger.error("No source channels found! Please check your SOURCE_CHANNELS configuration.")
+            logger.error("No source channels found! Please check your routing configuration.")
             logger.error("Make sure the account is a member of the specified channels.")
             sys.exit(1)
-        
-        logger.info(f"Monitoring {len(matched_channel_ids)} source channel(s)")
+
+        logger.info(f"Monitoring {len(matched_channel_ids)} source channel(s) with {sum(len(v) for v in routing_table.values())} route(s)")
         
         # Register message handler
         @client.on(events.NewMessage(chats=matched_channel_ids))
@@ -627,19 +804,44 @@ async def main():
             try:
                 message = event.message
                 sender_chat = await event.get_chat()
-                
+
                 # Get message preview (first 50 chars)
                 text = message.text or ''
                 preview = text[:50].replace('\n', ' ') if text else '[Media/No text]'
                 if len(text) > 50:
                     preview += '...'
-                
+
                 # Pretty log the incoming message
                 logger.info(f"{'─' * 50}")
                 logger.info(f"📨 NEW MESSAGE")
                 logger.info(f"   From: {sender_chat.title}")
                 logger.info(f"   Preview: {preview}")
-                
+
+                # Determine which destinations this message should go to
+                source_routes = routing_table.get(sender_chat.id, [])
+                msg_topic_id = get_topic_id_from_message(message)
+
+                # Filter routes by topic: topic_id=None matches all, specific topic matches only that topic
+                target_dest_ids = set()
+                for resolved_route in source_routes:
+                    if resolved_route.topic_id is None:
+                        # No topic filter — forward all messages
+                        target_dest_ids.update(resolved_route.destinations)
+                    elif resolved_route.topic_id == msg_topic_id:
+                        # Topic filter matches this message's topic
+                        target_dest_ids.update(resolved_route.destinations)
+
+                if not target_dest_ids:
+                    if msg_topic_id is not None:
+                        logger.info(f"   ⏭️  Skipped (topic {msg_topic_id} not in any route)")
+                    else:
+                        logger.info(f"   ⏭️  Skipped (no matching route)")
+                    logger.info(f"{'─' * 50}")
+                    return
+
+                if msg_topic_id is not None:
+                    logger.info(f"   📌 Forum topic: {msg_topic_id}")
+
                 # Check for blocked words
                 if BLOCKED_WORDS:
                     message_lower = text.lower()
@@ -649,39 +851,53 @@ async def main():
                             logger.info(f"{'─' * 50}")
                             message_queue_manager.global_stats['total_blocked'] += 1
                             return
-                
+
                 # Check if copy is enabled
                 if not COPY_ENABLED:
                     logger.info(f"   ⏸️  DRY-RUN MODE - Message NOT copied")
                     logger.info(f"{'─' * 50}")
                     return
-                
+
                 # Check if this message is a reply to another message
                 reply_to_dest_ids = {}
-                if message.reply_to_msg_id:
-                    # Look up the destination message IDs for the replied message
-                    mappings = await message_mapper.get_all_destination_mappings(
-                        source_msg_id=message.reply_to_msg_id,
-                        source_channel_id=sender_chat.id
-                    )
-                    for dest_msg_id, dest_channel_id in mappings:
-                        reply_to_dest_ids[dest_channel_id] = dest_msg_id
-                    
-                    if reply_to_dest_ids:
-                        logger.info(f"   ↩️  Reply to message #{message.reply_to_msg_id} (found in {len(reply_to_dest_ids)} dest)")
-                    else:
-                        logger.info(f"   ↩️  Reply to message #{message.reply_to_msg_id} (original not found)")
-                
-                # Add message to all destination queues
-                await message_queue_manager.broadcast_message(
+                reply_to_id = message.reply_to_msg_id
+                if reply_to_id:
+                    # In forums, reply_to_msg_id may point to the topic service message
+                    # (not a real reply). Skip reply tracking if it's just the topic ID.
+                    is_real_reply = True
+                    if msg_topic_id is not None:
+                        reply_to = getattr(message, 'reply_to', None)
+                        top_id = getattr(reply_to, 'reply_to_top_id', None) if reply_to else None
+                        if top_id is None:
+                            # reply_to_msg_id points to the topic service message, not a real reply
+                            is_real_reply = False
+
+                    if is_real_reply:
+                        mappings = await message_mapper.get_all_destination_mappings(
+                            source_msg_id=reply_to_id,
+                            source_channel_id=sender_chat.id
+                        )
+                        for dest_msg_id, dest_channel_id in mappings:
+                            if dest_channel_id in target_dest_ids:
+                                reply_to_dest_ids[dest_channel_id] = dest_msg_id
+
+                        if reply_to_dest_ids:
+                            logger.info(f"   ↩️  Reply to message #{reply_to_id} (found in {len(reply_to_dest_ids)} dest)")
+                        else:
+                            logger.info(f"   ↩️  Reply to message #{reply_to_id} (original not found)")
+
+                # Route message to matched destinations only
+                await message_queue_manager.route_message(
                     message=message,
                     sender_title=sender_chat.title,
                     preview=preview,
                     source_channel_id=sender_chat.id,
+                    destination_ids=list(target_dest_ids),
                     reply_to_dest_ids=reply_to_dest_ids
                 )
+                logger.info(f"   📤 Routed to {len(target_dest_ids)} destination(s)")
                 logger.info(f"{'─' * 50}")
-                
+
             except Exception as e:
                 logger.error(f"❌ Error processing message: {e}")
         
