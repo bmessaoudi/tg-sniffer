@@ -18,7 +18,7 @@ API_HASH = os.getenv("API_HASH")
 TELEGRAM_STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION")
 
 # Canale da cercare
-TARGET_CHANNEL = "VERTEX VIP"
+TARGET_CHANNEL = "GOLDENERA"
 
 
 async def find_channel():
