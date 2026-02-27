@@ -18,6 +18,7 @@ class Route:
     source: Union[int, str]      # Channel ID or name
     destinations: List[int]      # Destination channel IDs
     topic_id: Optional[int]      # None = all messages, int = only that forum topic
+    copy_media: bool = False     # True = forward media, False = text-only
 
 
 @dataclass
@@ -26,6 +27,7 @@ class ResolvedRoute:
     source_channel_id: int
     destinations: List[int]
     topic_id: Optional[int]
+    copy_media: bool = False
 
 
 # =============================================================================
@@ -218,6 +220,12 @@ def _parse_channel_routes(raw: str) -> List[Route]:
             logger.warning(f"Invalid route (empty source or destinations): {rule}")
             continue
 
+        # Parse +media flag
+        copy_media = False
+        if '+media' in source_part:
+            copy_media = True
+            source_part = source_part.replace('+media', '')
+
         # Parse topic filter: source_id/topic_id
         topic_id = None
         if '/' in source_part:
@@ -249,7 +257,7 @@ def _parse_channel_routes(raw: str) -> List[Route]:
             logger.warning(f"No valid destinations in route: {rule}")
             continue
 
-        routes.append(Route(source=source, destinations=destinations, topic_id=topic_id))
+        routes.append(Route(source=source, destinations=destinations, topic_id=topic_id, copy_media=copy_media))
 
     return routes
 
@@ -436,7 +444,7 @@ class DestinationQueue:
         self._client = client
         self._message_mapper = message_mapper
     
-    async def add_message(self, message, sender_title, preview, source_channel_id, reply_to_dest_id=None):
+    async def add_message(self, message, sender_title, preview, source_channel_id, reply_to_dest_id=None, copy_media=False):
         """Add a message to the queue."""
         self.stats['total_received'] += 1
         await self.queue.put({
@@ -445,6 +453,7 @@ class DestinationQueue:
             'preview': preview,
             'source_channel_id': source_channel_id,
             'reply_to_dest_id': reply_to_dest_id,
+            'copy_media': copy_media,
             'timestamp': datetime.now(),
             'retries': 0,
         })
@@ -478,18 +487,34 @@ class DestinationQueue:
                 sender_title = item['sender_title']
                 preview = item['preview']
                 reply_to_dest_id = item.get('reply_to_dest_id')
+                copy_media = item.get('copy_media', False)
                 retries = item['retries']
-                
+
+                # Text-only mode: skip media-only messages (no text content)
+                if not copy_media and not message.text:
+                    logger.info(f"   ⏭️  Skipped media-only for '{self.validated_dest.title}'")
+                    self.queue.task_done()
+                    continue
+
                 success = False
-                
+
                 while not success and retries < self.max_retries:
                     try:
-                        # Send the message using cached entity (with reply_to if applicable)
-                        sent_message = await self._client.send_message(
-                            entity=self.validated_dest.entity,
-                            message=message,
-                            reply_to=reply_to_dest_id
-                        )
+                        if copy_media:
+                            # Full message (text + media)
+                            sent_message = await self._client.send_message(
+                                entity=self.validated_dest.entity,
+                                message=message,
+                                reply_to=reply_to_dest_id
+                            )
+                        else:
+                            # Text only — send text with formatting entities
+                            sent_message = await self._client.send_message(
+                                entity=self.validated_dest.entity,
+                                message=message.text,
+                                formatting_entities=message.entities,
+                                reply_to=reply_to_dest_id
+                            )
                         success = True
                         self.stats['total_sent'] += 1
 
@@ -577,7 +602,7 @@ class MessageQueueManager:
                 reply_to_dest_id=reply_to_dest_id
             )
 
-    async def route_message(self, message, sender_title, preview, source_channel_id, destination_ids: List[int], reply_to_dest_ids: Dict[int, int] = None):
+    async def route_message(self, message, sender_title, preview, source_channel_id, destination_ids: List[int], reply_to_dest_ids: Dict[int, int] = None, media_dest_ids: set = None):
         """Add a message to specific destination queues (per-source routing)."""
         self.global_stats['total_received'] += 1
 
@@ -585,12 +610,14 @@ class MessageQueueManager:
             queue = self.queues.get(dest_id)
             if queue:
                 reply_to_dest_id = reply_to_dest_ids.get(dest_id) if reply_to_dest_ids else None
+                copy_media = dest_id in media_dest_ids if media_dest_ids else False
                 await queue.add_message(
                     message=message,
                     sender_title=sender_title,
                     preview=preview,
                     source_channel_id=source_channel_id,
-                    reply_to_dest_id=reply_to_dest_id
+                    reply_to_dest_id=reply_to_dest_id,
+                    copy_media=copy_media
                 )
     
     async def start_workers(self):
@@ -785,7 +812,8 @@ async def main():
             resolved = ResolvedRoute(
                 source_channel_id=src_id,
                 destinations=route.destinations,
-                topic_id=route.topic_id
+                topic_id=route.topic_id,
+                copy_media=route.copy_media
             )
             routing_table.setdefault(src_id, []).append(resolved)
 
@@ -823,13 +851,12 @@ async def main():
 
                 # Filter routes by topic: topic_id=None matches all, specific topic matches only that topic
                 target_dest_ids = set()
+                media_dest_ids = set()
                 for resolved_route in source_routes:
-                    if resolved_route.topic_id is None:
-                        # No topic filter — forward all messages
+                    if resolved_route.topic_id is None or resolved_route.topic_id == msg_topic_id:
                         target_dest_ids.update(resolved_route.destinations)
-                    elif resolved_route.topic_id == msg_topic_id:
-                        # Topic filter matches this message's topic
-                        target_dest_ids.update(resolved_route.destinations)
+                        if resolved_route.copy_media:
+                            media_dest_ids.update(resolved_route.destinations)
 
                 if not target_dest_ids:
                     if msg_topic_id is not None:
@@ -893,7 +920,8 @@ async def main():
                     preview=preview,
                     source_channel_id=sender_chat.id,
                     destination_ids=list(target_dest_ids),
-                    reply_to_dest_ids=reply_to_dest_ids
+                    reply_to_dest_ids=reply_to_dest_ids,
+                    media_dest_ids=media_dest_ids
                 )
                 logger.info(f"   📤 Routed to {len(target_dest_ids)} destination(s)")
                 logger.info(f"{'─' * 50}")
