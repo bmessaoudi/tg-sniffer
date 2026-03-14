@@ -1,12 +1,13 @@
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.errors import ChannelPrivateError, UserNotParticipantError, ChatWriteForbiddenError
+from telethon.errors import ChannelPrivateError, UserNotParticipantError, ChatWriteForbiddenError, MessageNotModifiedError
 import os
 from dotenv import load_dotenv
 import logging
 import sys
 from datetime import datetime
 import asyncio
+import time
 from collections import deque
 from dataclasses import dataclass
 from database import MessageMapper
@@ -500,11 +501,39 @@ class DestinationQueue:
 
                 while not success and retries < self.max_retries:
                     try:
-                        if copy_media:
-                            # Full message (text + media)
+                        if copy_media and message.media:
+                            # Download & re-upload to avoid "forward from protected chat" errors
+                            media_bytes = await self._client.download_media(message, bytes)
+                            caption = message.text or ''
+                            entities = message.entities
+                            if len(caption) > 1024:
+                                caption = caption[:1021] + '...'
+                                # Filter entities to fit truncated caption
+                                if entities:
+                                    filtered = []
+                                    for e in entities:
+                                        if e.offset >= len(caption):
+                                            continue
+                                        if e.offset + e.length > len(caption):
+                                            e = type(e)(offset=e.offset, length=len(caption) - e.offset, **{
+                                                k: v for k, v in e.to_dict().items()
+                                                if k not in ('_', 'offset', 'length')
+                                            })
+                                        filtered.append(e)
+                                    entities = filtered if filtered else None
+                            sent_message = await self._client.send_file(
+                                entity=self.validated_dest.entity,
+                                file=media_bytes,
+                                caption=caption,
+                                formatting_entities=entities,
+                                reply_to=reply_to_dest_id
+                            )
+                        elif copy_media:
+                            # copy_media route but no actual media (text-only message)
                             sent_message = await self._client.send_message(
                                 entity=self.validated_dest.entity,
-                                message=message,
+                                message=message.text,
+                                formatting_entities=message.entities,
                                 reply_to=reply_to_dest_id
                             )
                         else:
@@ -826,12 +855,34 @@ async def main():
 
         logger.info(f"Monitoring {len(matched_channel_ids)} source channel(s) with {sum(len(v) for v in routing_table.values())} route(s)")
         
+        # Message deduplication cache (TTL-based)
+        _seen_messages = {}  # {(channel_id, msg_id): timestamp}
+        _DEDUP_TTL = 300  # 5 minutes
+
+        def _is_duplicate(channel_id: int, msg_id: int) -> bool:
+            """Return True if message was already processed recently."""
+            key = (channel_id, msg_id)
+            now = time.time()
+            # Cleanup old entries
+            expired = [k for k, t in _seen_messages.items() if now - t > _DEDUP_TTL]
+            for k in expired:
+                del _seen_messages[k]
+            if key in _seen_messages:
+                return True
+            _seen_messages[key] = now
+            return False
+
         # Register message handler
         @client.on(events.NewMessage(chats=matched_channel_ids))
         async def message_handler(event):
             try:
                 message = event.message
                 sender_chat = await event.get_chat()
+
+                # Deduplication check
+                if _is_duplicate(sender_chat.id, message.id):
+                    logger.info(f"   ⏭️  Skipped (duplicate) msg {message.id} from {sender_chat.title}")
+                    return
 
                 # Get message preview (first 50 chars)
                 text = message.text or ''
@@ -966,6 +1017,8 @@ async def main():
                             text=message.text
                         )
                         edit_count += 1
+                    except MessageNotModifiedError:
+                        edit_count += 1  # Content already matches, count as success
                     except Exception as e:
                         logger.error(f"❌ Failed to edit message {dest_msg_id} in {dest_channel_id}: {e}")
                 
