@@ -1,6 +1,7 @@
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import ChannelPrivateError, UserNotParticipantError, ChatWriteForbiddenError, MessageNotModifiedError
+from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeAudio, DocumentAttributeVideo, DocumentAttributeImageSize, DocumentAttributeAnimated, DocumentAttributeSticker
 import os
 from dotenv import load_dotenv
 import logging
@@ -521,12 +522,31 @@ class DestinationQueue:
                                             })
                                         filtered.append(e)
                                     entities = filtered if filtered else None
+
+                            # Extract original file attributes (name, dimensions, duration, etc.)
+                            file_attributes = []
+                            force_document = False
+                            doc = getattr(message, 'document', None) or getattr(getattr(message, 'media', None), 'document', None)
+                            if doc and hasattr(doc, 'attributes'):
+                                for attr in doc.attributes:
+                                    if isinstance(attr, (DocumentAttributeFilename, DocumentAttributeAudio,
+                                                         DocumentAttributeVideo, DocumentAttributeAnimated,
+                                                         DocumentAttributeSticker)):
+                                        file_attributes.append(attr)
+                                # If it was sent as a document (not compressed photo), keep it as document
+                                if not any(isinstance(attr, (DocumentAttributeVideo, DocumentAttributeAnimated,
+                                                             DocumentAttributeSticker)) for attr in doc.attributes):
+                                    if any(isinstance(attr, DocumentAttributeFilename) for attr in doc.attributes):
+                                        force_document = True
+
                             sent_message = await self._client.send_file(
                                 entity=self.validated_dest.entity,
                                 file=media_bytes,
                                 caption=caption,
                                 formatting_entities=entities,
-                                reply_to=reply_to_dest_id
+                                reply_to=reply_to_dest_id,
+                                attributes=file_attributes if file_attributes else None,
+                                force_document=force_document
                             )
                         elif copy_media:
                             # copy_media route but no actual media (text-only message)
@@ -764,10 +784,13 @@ async def main():
     logger.info("")
     
     # Initialize client
+    # sequential_updates=False prevents Telethon from buffering updates when
+    # it detects pts gaps in supergroups/forums (which causes 1-5 min delays).
     client = TelegramClient(
         StringSession(TELEGRAM_STRING_SESSION),
         API_ID,
-        API_HASH
+        API_HASH,
+        sequential_updates=False
     )
 
     # message_queue_manager will be initialized after destination validation
@@ -776,6 +799,12 @@ async def main():
     try:
         await client.start()
         logger.info("Client connected successfully")
+
+        # Force Telethon to sync update state with the server.
+        # Without this, supergroup/forum updates may be delayed because
+        # StringSession doesn't persist pts state across restarts.
+        await client.catch_up()
+        logger.info("Update state synchronized")
 
         # Validate destination channels before proceeding
         logger.info("Validating destination channels...")
