@@ -102,6 +102,7 @@ load_dotenv()
 API_ID = os.getenv('API_ID')
 API_HASH = os.getenv('API_HASH')
 TELEGRAM_STRING_SESSION = os.getenv('TELEGRAM_STRING_SESSION')
+SESSION_FILE = os.getenv('SESSION_FILE', 'tg-sniffer')
 
 # Source channels - comma-separated list of channel names OR IDs
 # Example: "Channel Name 1,Channel Name 2" or "1234567890,0987654321"
@@ -144,8 +145,8 @@ def validate_config():
         errors.append("API_ID is required")
     if not API_HASH:
         errors.append("API_HASH is required")
-    if not TELEGRAM_STRING_SESSION:
-        errors.append("TELEGRAM_STRING_SESSION is required")
+    if not TELEGRAM_STRING_SESSION and not os.path.exists(f'{SESSION_FILE}.session'):
+        errors.append("TELEGRAM_STRING_SESSION is required (or provide an existing SESSION_FILE)")
 
     # CHANNEL_ROUTES replaces SOURCE_CHANNELS + DESTINATION_CHANNEL_IDS
     if not CHANNEL_ROUTES:
@@ -783,11 +784,30 @@ async def main():
     logger.info("╚" + "═" * 58 + "╝")
     logger.info("")
     
-    # Initialize client
-    # sequential_updates=False prevents Telethon from buffering updates when
-    # it detects pts gaps in supergroups/forums (which causes 1-5 min delays).
+    # Initialize client with persistent SQLite session.
+    # StringSession doesn't persist pts (update state) per channel, so on restart
+    # Telethon detects a "gap" for supergroups and calls getChannelDifference(),
+    # which can block updates for ~7 minutes. A SQLite session file persists the
+    # pts state, eliminating the gap and the delay.
+    if not os.path.exists(f'{SESSION_FILE}.session') and TELEGRAM_STRING_SESSION:
+        # First run: bootstrap SQLite session file from StringSession
+        logger.info("Bootstrapping SQLite session from StringSession...")
+        string_session = StringSession(TELEGRAM_STRING_SESSION)
+        # Create a temporary client with SQLite session, copy auth data from StringSession
+        bootstrap_client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+        bootstrap_client.session.set_dc(
+            string_session.dc_id,
+            string_session.server_address,
+            string_session.port
+        )
+        bootstrap_client.session.auth_key = string_session.auth_key
+        bootstrap_client.session.save()
+        del bootstrap_client
+        logger.info(f"SQLite session created: {SESSION_FILE}.session")
+
+    logger.info(f"Using persistent SQLite session: {SESSION_FILE}.session")
     client = TelegramClient(
-        StringSession(TELEGRAM_STRING_SESSION),
+        SESSION_FILE,
         API_ID,
         API_HASH,
         sequential_updates=False
@@ -799,12 +819,6 @@ async def main():
     try:
         await client.start()
         logger.info("Client connected successfully")
-
-        # Force Telethon to sync update state with the server.
-        # Without this, supergroup/forum updates may be delayed because
-        # StringSession doesn't persist pts state across restarts.
-        await client.catch_up()
-        logger.info("Update state synchronized")
 
         # Validate destination channels before proceeding
         logger.info("Validating destination channels...")
