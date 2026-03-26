@@ -784,11 +784,12 @@ async def main():
     logger.info("╚" + "═" * 58 + "╝")
     logger.info("")
     
-    # Initialize client with persistent SQLite session.
+    # Initialize client with persistent SQLite session + catch_up=True.
     # StringSession doesn't persist pts (update state) per channel, so on restart
     # Telethon detects a "gap" for supergroups and calls getChannelDifference(),
     # which can block updates for ~7 minutes. A SQLite session file persists the
-    # pts state, eliminating the gap and the delay.
+    # pts state, and catch_up=True loads per-channel pts at connect time, so the
+    # _message_box already knows channel states before the update loop begins.
     if not os.path.exists(f'{SESSION_FILE}.session') and TELEGRAM_STRING_SESSION:
         # First run: bootstrap SQLite session file from StringSession
         logger.info("Bootstrapping SQLite session from StringSession...")
@@ -810,7 +811,8 @@ async def main():
         SESSION_FILE,
         API_ID,
         API_HASH,
-        sequential_updates=False
+        sequential_updates=False,
+        catch_up=True  # Load per-channel pts from SQLite session to prevent getChannelDifference delays
     )
 
     # message_queue_manager will be initialized after destination validation
