@@ -2,6 +2,14 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import ChannelPrivateError, UserNotParticipantError, ChatWriteForbiddenError, MessageNotModifiedError
 from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeAudio, DocumentAttributeVideo, DocumentAttributeImageSize, DocumentAttributeAnimated, DocumentAttributeSticker
+
+# Monkey-patch Telethon's NO_UPDATES_TIMEOUT from 15 min to 60 seconds.
+# Telegram doesn't push real-time updates for some supergroups/forum topics,
+# so Telethon falls back to polling via getChannelDifference every NO_UPDATES_TIMEOUT.
+# See: https://github.com/LonamiWebs/Telethon/issues/4345
+import telethon._updates.messagebox as _mb
+_mb.NO_UPDATES_TIMEOUT = 60
+
 import os
 from dotenv import load_dotenv
 import logging
