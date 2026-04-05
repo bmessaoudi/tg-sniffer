@@ -8,7 +8,7 @@ from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeAudio,
 # so Telethon falls back to polling via getChannelDifference every NO_UPDATES_TIMEOUT.
 # See: https://github.com/LonamiWebs/Telethon/issues/4345
 import telethon._updates.messagebox as _mb
-_mb.NO_UPDATES_TIMEOUT = 30
+_mb.NO_UPDATES_TIMEOUT = 15
 
 import os
 from dotenv import load_dotenv
@@ -1182,10 +1182,10 @@ async def main():
                     _entity_titles[src_id] = str(src_id)
 
             async def _topic_poller():
-                """Poll forum topics every 5s for near-real-time updates."""
+                """Poll forum topics every 3s for near-real-time updates."""
                 logger.info(f"📡 Topic poller started for {len(topic_pairs)} topic(s): {topic_pairs}")
                 while True:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(3)
                     for src_id, topic_id in topic_pairs:
                         try:
                             messages = await client.get_messages(src_id, reply_to=topic_id, limit=5)
