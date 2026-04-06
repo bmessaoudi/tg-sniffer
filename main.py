@@ -1184,13 +1184,25 @@ async def main():
             async def _topic_poller():
                 """Poll forum topics every 3s for near-real-time updates."""
                 logger.info(f"📡 Topic poller started for {len(topic_pairs)} topic(s): {topic_pairs}")
+                # Track last seen message ID per (src_id, topic_id) to avoid re-fetching
+                _last_seen: Dict[tuple, int] = {}
+                # Bootstrap: fetch current latest msg per topic so we don't replay old messages
+                for src_id, topic_id in topic_pairs:
+                    try:
+                        msgs = await client.get_messages(src_id, reply_to=topic_id, limit=1)
+                        if msgs and msgs[0]:
+                            _last_seen[(src_id, topic_id)] = msgs[0].id
+                    except Exception:
+                        pass
                 while True:
                     await asyncio.sleep(3)
                     for src_id, topic_id in topic_pairs:
                         try:
-                            messages = await client.get_messages(src_id, reply_to=topic_id, limit=5)
-                            for msg in messages:
-                                if msg:
+                            min_id = _last_seen.get((src_id, topic_id), 0)
+                            messages = await client.get_messages(src_id, reply_to=topic_id, limit=5, min_id=min_id)
+                            for msg in reversed(messages):  # oldest first
+                                if msg and msg.id > min_id:
+                                    _last_seen[(src_id, topic_id)] = msg.id
                                     await process_new_message(msg, src_id, _entity_titles.get(src_id, str(src_id)))
                         except Exception as e:
                             logger.debug(f"Topic poll error for {src_id}/topic:{topic_id}: {e}")
