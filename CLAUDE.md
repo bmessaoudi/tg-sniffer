@@ -123,14 +123,25 @@ Auto-migration support: `database.py:38-51`
 
 ---
 
-## Skills (Slash Commands)
+## Skills
 
-| Command | Purpose |
-|---------|---------|
-| `/test-bot` | Test configuration in dry-run mode |
-| `/add-channel` | Add source/destination channels |
-| `/db-stats` | Show database statistics |
-| `/check-config` | Validate environment setup |
+### Project Skills (`.claude/skills/`)
+
+| Skill | Purpose |
+|-------|---------|
+| `telethon-forwarder` | Telethon event handlers, entity resolution, reply tracking, FloodWaitError handling |
+| `aiosqlite-patterns` | WAL mode, migrations, safe IN-clauses, batch inserts, cleanup strategies |
+| `async-message-queue` | Per-destination queues, retry with backoff, graceful shutdown, fan-out |
+
+### Installed Global Skills (`~/.claude/skills/`)
+
+| Skill | Source | Purpose |
+|-------|--------|---------|
+| `python-testing-patterns` | `wshobson/agents` | pytest + pytest-asyncio patterns, mocking, fixtures |
+| `asyncio` | `bobmatnyc/claude-mpm-skills` | asyncio gather, locks, semaphores, error resilience |
+| `docker` | `panaversity/agentfactory` | Multi-stage builds, security defaults, health checks |
+| `telegram-bot` | `openclaudia/openclaudia-skills` | General Telegram bot patterns, complements telethon-forwarder |
+| `database-sqlite` | `niller2005/polyflup` | SQLite-specific patterns, complements aiosqlite-patterns |
 
 ---
 
@@ -153,7 +164,9 @@ Use these agents via Task tool for domain-specific help:
 | Topic | File |
 |-------|------|
 | Design patterns & architecture | `.claude/docs/architectural_patterns.md` |
-| Skills definitions | `.claude/skills/*/SKILL.md` |
+| Telethon forwarding patterns | `.claude/skills/telethon-forwarder/SKILL.md` |
+| Async SQLite patterns | `.claude/skills/aiosqlite-patterns/SKILL.md` |
+| Message queue patterns | `.claude/skills/async-message-queue/SKILL.md` |
 | Agent definitions | `.claude/agents/*.md` |
 
 ---

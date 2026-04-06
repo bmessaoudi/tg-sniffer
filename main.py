@@ -1,6 +1,15 @@
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import ChannelPrivateError, UserNotParticipantError, ChatWriteForbiddenError, MessageNotModifiedError
+from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeAudio, DocumentAttributeVideo, DocumentAttributeImageSize, DocumentAttributeAnimated, DocumentAttributeSticker
+
+# Monkey-patch Telethon's NO_UPDATES_TIMEOUT from 15 min to 30 seconds.
+# Telegram doesn't push real-time updates for some supergroups/forum topics,
+# so Telethon falls back to polling via getChannelDifference every NO_UPDATES_TIMEOUT.
+# See: https://github.com/LonamiWebs/Telethon/issues/4345
+import telethon._updates.messagebox as _mb
+_mb.NO_UPDATES_TIMEOUT = 15
+
 import os
 from dotenv import load_dotenv
 import logging
@@ -101,6 +110,7 @@ load_dotenv()
 API_ID = os.getenv('API_ID')
 API_HASH = os.getenv('API_HASH')
 TELEGRAM_STRING_SESSION = os.getenv('TELEGRAM_STRING_SESSION')
+SESSION_FILE = os.getenv('SESSION_FILE', 'tg-sniffer')
 
 # Source channels - comma-separated list of channel names OR IDs
 # Example: "Channel Name 1,Channel Name 2" or "1234567890,0987654321"
@@ -143,8 +153,8 @@ def validate_config():
         errors.append("API_ID is required")
     if not API_HASH:
         errors.append("API_HASH is required")
-    if not TELEGRAM_STRING_SESSION:
-        errors.append("TELEGRAM_STRING_SESSION is required")
+    if not TELEGRAM_STRING_SESSION and not os.path.exists(f'{SESSION_FILE}.session'):
+        errors.append("TELEGRAM_STRING_SESSION is required (or provide an existing SESSION_FILE)")
 
     # CHANNEL_ROUTES replaces SOURCE_CHANNELS + DESTINATION_CHANNEL_IDS
     if not CHANNEL_ROUTES:
@@ -521,12 +531,31 @@ class DestinationQueue:
                                             })
                                         filtered.append(e)
                                     entities = filtered if filtered else None
+
+                            # Extract original file attributes (name, dimensions, duration, etc.)
+                            file_attributes = []
+                            force_document = False
+                            doc = getattr(message, 'document', None) or getattr(getattr(message, 'media', None), 'document', None)
+                            if doc and hasattr(doc, 'attributes'):
+                                for attr in doc.attributes:
+                                    if isinstance(attr, (DocumentAttributeFilename, DocumentAttributeAudio,
+                                                         DocumentAttributeVideo, DocumentAttributeAnimated,
+                                                         DocumentAttributeSticker)):
+                                        file_attributes.append(attr)
+                                # If it was sent as a document (not compressed photo), keep it as document
+                                if not any(isinstance(attr, (DocumentAttributeVideo, DocumentAttributeAnimated,
+                                                             DocumentAttributeSticker)) for attr in doc.attributes):
+                                    if any(isinstance(attr, DocumentAttributeFilename) for attr in doc.attributes):
+                                        force_document = True
+
                             sent_message = await self._client.send_file(
                                 entity=self.validated_dest.entity,
                                 file=media_bytes,
                                 caption=caption,
                                 formatting_entities=entities,
-                                reply_to=reply_to_dest_id
+                                reply_to=reply_to_dest_id,
+                                attributes=file_attributes if file_attributes else None,
+                                force_document=force_document
                             )
                         elif copy_media:
                             # copy_media route but no actual media (text-only message)
@@ -763,11 +792,35 @@ async def main():
     logger.info("╚" + "═" * 58 + "╝")
     logger.info("")
     
-    # Initialize client
+    # Initialize client with persistent SQLite session + catch_up=True.
+    # StringSession doesn't persist pts (update state) per channel, so on restart
+    # Telethon detects a "gap" for supergroups and calls getChannelDifference(),
+    # which can block updates for ~7 minutes. A SQLite session file persists the
+    # pts state, and catch_up=True loads per-channel pts at connect time, so the
+    # _message_box already knows channel states before the update loop begins.
+    if not os.path.exists(f'{SESSION_FILE}.session') and TELEGRAM_STRING_SESSION:
+        # First run: bootstrap SQLite session file from StringSession
+        logger.info("Bootstrapping SQLite session from StringSession...")
+        string_session = StringSession(TELEGRAM_STRING_SESSION)
+        # Create a temporary client with SQLite session, copy auth data from StringSession
+        bootstrap_client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+        bootstrap_client.session.set_dc(
+            string_session.dc_id,
+            string_session.server_address,
+            string_session.port
+        )
+        bootstrap_client.session.auth_key = string_session.auth_key
+        bootstrap_client.session.save()
+        del bootstrap_client
+        logger.info(f"SQLite session created: {SESSION_FILE}.session")
+
+    logger.info(f"Using persistent SQLite session: {SESSION_FILE}.session")
     client = TelegramClient(
-        StringSession(TELEGRAM_STRING_SESSION),
+        SESSION_FILE,
         API_ID,
-        API_HASH
+        API_HASH,
+        sequential_updates=False,
+        catch_up=True  # Load per-channel pts from SQLite session to prevent getChannelDifference delays
     )
 
     # message_queue_manager will be initialized after destination validation
@@ -872,111 +925,115 @@ async def main():
             _seen_messages[key] = now
             return False
 
+        # Core message processing logic, used by both the event handler and topic poller
+        async def process_new_message(message, source_channel_id, source_title):
+            """Process a new message from a source channel. Returns True if routed."""
+            # Deduplication check
+            if _is_duplicate(source_channel_id, message.id):
+                logger.info(f"   ⏭️  Skipped (duplicate) msg {message.id} from {source_title}")
+                return False
+
+            # Get message preview (first 50 chars)
+            text = message.text or ''
+            preview = text[:50].replace('\n', ' ') if text else '[Media/No text]'
+            if len(text) > 50:
+                preview += '...'
+
+            # Pretty log the incoming message
+            logger.info(f"{'─' * 50}")
+            logger.info(f"📨 NEW MESSAGE")
+            logger.info(f"   From: {source_title}")
+            logger.info(f"   Preview: {preview}")
+
+            # Determine which destinations this message should go to
+            source_routes = routing_table.get(source_channel_id, [])
+            msg_topic_id = get_topic_id_from_message(message)
+
+            # Filter routes by topic: topic_id=None matches all, specific topic matches only that topic
+            target_dest_ids = set()
+            media_dest_ids = set()
+            for resolved_route in source_routes:
+                if resolved_route.topic_id is None or resolved_route.topic_id == msg_topic_id:
+                    target_dest_ids.update(resolved_route.destinations)
+                    if resolved_route.copy_media:
+                        media_dest_ids.update(resolved_route.destinations)
+
+            if not target_dest_ids:
+                if msg_topic_id is not None:
+                    logger.info(f"   ⏭️  Skipped (topic {msg_topic_id} not in any route)")
+                else:
+                    logger.info(f"   ⏭️  Skipped (no matching route)")
+                logger.info(f"{'─' * 50}")
+                return False
+
+            if msg_topic_id is not None:
+                logger.info(f"   📌 Forum topic: {msg_topic_id}")
+
+            # Check for blocked words
+            if BLOCKED_WORDS:
+                message_lower = text.lower()
+                for blocked_word in BLOCKED_WORDS:
+                    if blocked_word in message_lower:
+                        logger.warning(f"   ⛔ BLOCKED - Contains: '{blocked_word}'")
+                        logger.info(f"{'─' * 50}")
+                        message_queue_manager.global_stats['total_blocked'] += 1
+                        return False
+
+            # Check if copy is enabled
+            if not COPY_ENABLED:
+                logger.info(f"   ⏸️  DRY-RUN MODE - Message NOT copied")
+                logger.info(f"{'─' * 50}")
+                return False
+
+            # Check if this message is a reply to another message
+            reply_to_dest_ids = {}
+            reply_to_id = message.reply_to_msg_id
+            if reply_to_id:
+                # In forums, reply_to_msg_id may point to the topic service message
+                # (not a real reply). Skip reply tracking if it's just the topic ID.
+                is_real_reply = True
+                if msg_topic_id is not None:
+                    reply_to = getattr(message, 'reply_to', None)
+                    top_id = getattr(reply_to, 'reply_to_top_id', None) if reply_to else None
+                    if top_id is None:
+                        # reply_to_msg_id points to the topic service message, not a real reply
+                        is_real_reply = False
+
+                if is_real_reply:
+                    mappings = await message_mapper.get_all_destination_mappings(
+                        source_msg_id=reply_to_id,
+                        source_channel_id=source_channel_id
+                    )
+                    for dest_msg_id, dest_channel_id in mappings:
+                        if dest_channel_id in target_dest_ids:
+                            reply_to_dest_ids[dest_channel_id] = dest_msg_id
+
+                    if reply_to_dest_ids:
+                        logger.info(f"   ↩️  Reply to message #{reply_to_id} (found in {len(reply_to_dest_ids)} dest)")
+                    else:
+                        logger.info(f"   ↩️  Reply to message #{reply_to_id} (original not found)")
+
+            # Route message to matched destinations only
+            await message_queue_manager.route_message(
+                message=message,
+                sender_title=source_title,
+                preview=preview,
+                source_channel_id=source_channel_id,
+                destination_ids=list(target_dest_ids),
+                reply_to_dest_ids=reply_to_dest_ids,
+                media_dest_ids=media_dest_ids
+            )
+            logger.info(f"   📤 Routed to {len(target_dest_ids)} destination(s)")
+            logger.info(f"{'─' * 50}")
+            return True
+
         # Register message handler
         @client.on(events.NewMessage(chats=matched_channel_ids))
         async def message_handler(event):
             try:
                 message = event.message
                 sender_chat = await event.get_chat()
-
-                # Deduplication check
-                if _is_duplicate(sender_chat.id, message.id):
-                    logger.info(f"   ⏭️  Skipped (duplicate) msg {message.id} from {sender_chat.title}")
-                    return
-
-                # Get message preview (first 50 chars)
-                text = message.text or ''
-                preview = text[:50].replace('\n', ' ') if text else '[Media/No text]'
-                if len(text) > 50:
-                    preview += '...'
-
-                # Pretty log the incoming message
-                logger.info(f"{'─' * 50}")
-                logger.info(f"📨 NEW MESSAGE")
-                logger.info(f"   From: {sender_chat.title}")
-                logger.info(f"   Preview: {preview}")
-
-                # Determine which destinations this message should go to
-                source_routes = routing_table.get(sender_chat.id, [])
-                msg_topic_id = get_topic_id_from_message(message)
-
-                # Filter routes by topic: topic_id=None matches all, specific topic matches only that topic
-                target_dest_ids = set()
-                media_dest_ids = set()
-                for resolved_route in source_routes:
-                    if resolved_route.topic_id is None or resolved_route.topic_id == msg_topic_id:
-                        target_dest_ids.update(resolved_route.destinations)
-                        if resolved_route.copy_media:
-                            media_dest_ids.update(resolved_route.destinations)
-
-                if not target_dest_ids:
-                    if msg_topic_id is not None:
-                        logger.info(f"   ⏭️  Skipped (topic {msg_topic_id} not in any route)")
-                    else:
-                        logger.info(f"   ⏭️  Skipped (no matching route)")
-                    logger.info(f"{'─' * 50}")
-                    return
-
-                if msg_topic_id is not None:
-                    logger.info(f"   📌 Forum topic: {msg_topic_id}")
-
-                # Check for blocked words
-                if BLOCKED_WORDS:
-                    message_lower = text.lower()
-                    for blocked_word in BLOCKED_WORDS:
-                        if blocked_word in message_lower:
-                            logger.warning(f"   ⛔ BLOCKED - Contains: '{blocked_word}'")
-                            logger.info(f"{'─' * 50}")
-                            message_queue_manager.global_stats['total_blocked'] += 1
-                            return
-
-                # Check if copy is enabled
-                if not COPY_ENABLED:
-                    logger.info(f"   ⏸️  DRY-RUN MODE - Message NOT copied")
-                    logger.info(f"{'─' * 50}")
-                    return
-
-                # Check if this message is a reply to another message
-                reply_to_dest_ids = {}
-                reply_to_id = message.reply_to_msg_id
-                if reply_to_id:
-                    # In forums, reply_to_msg_id may point to the topic service message
-                    # (not a real reply). Skip reply tracking if it's just the topic ID.
-                    is_real_reply = True
-                    if msg_topic_id is not None:
-                        reply_to = getattr(message, 'reply_to', None)
-                        top_id = getattr(reply_to, 'reply_to_top_id', None) if reply_to else None
-                        if top_id is None:
-                            # reply_to_msg_id points to the topic service message, not a real reply
-                            is_real_reply = False
-
-                    if is_real_reply:
-                        mappings = await message_mapper.get_all_destination_mappings(
-                            source_msg_id=reply_to_id,
-                            source_channel_id=sender_chat.id
-                        )
-                        for dest_msg_id, dest_channel_id in mappings:
-                            if dest_channel_id in target_dest_ids:
-                                reply_to_dest_ids[dest_channel_id] = dest_msg_id
-
-                        if reply_to_dest_ids:
-                            logger.info(f"   ↩️  Reply to message #{reply_to_id} (found in {len(reply_to_dest_ids)} dest)")
-                        else:
-                            logger.info(f"   ↩️  Reply to message #{reply_to_id} (original not found)")
-
-                # Route message to matched destinations only
-                await message_queue_manager.route_message(
-                    message=message,
-                    sender_title=sender_chat.title,
-                    preview=preview,
-                    source_channel_id=sender_chat.id,
-                    destination_ids=list(target_dest_ids),
-                    reply_to_dest_ids=reply_to_dest_ids,
-                    media_dest_ids=media_dest_ids
-                )
-                logger.info(f"   📤 Routed to {len(target_dest_ids)} destination(s)")
-                logger.info(f"{'─' * 50}")
-
+                await process_new_message(message, sender_chat.id, sender_chat.title)
             except Exception as e:
                 logger.error(f"❌ Error processing message: {e}")
         
@@ -1106,11 +1163,47 @@ async def main():
             except Exception as e:
                 logger.error(f"❌ Error handling message deletion: {e}")
         
+        # Start topic poller for routes with specific topic_id
+        topic_pairs = set()
+        for src_id, routes in routing_table.items():
+            for route in routes:
+                if route.topic_id is not None:
+                    topic_pairs.add((src_id, route.topic_id))
+
+        topic_poll_task = None
+        if topic_pairs:
+            # Cache entity titles for poller logging
+            _entity_titles: Dict[int, str] = {}
+            for src_id in {p[0] for p in topic_pairs}:
+                try:
+                    entity = await client.get_entity(src_id)
+                    _entity_titles[src_id] = getattr(entity, 'title', str(src_id))
+                except Exception:
+                    _entity_titles[src_id] = str(src_id)
+
+            async def _topic_poller():
+                """Poll forum topics every 3s for near-real-time updates."""
+                logger.info(f"📡 Topic poller started for {len(topic_pairs)} topic(s): {topic_pairs}")
+                while True:
+                    await asyncio.sleep(3)
+                    for src_id, topic_id in topic_pairs:
+                        try:
+                            messages = await client.get_messages(src_id, reply_to=topic_id, limit=5)
+                            for msg in messages:
+                                if msg:
+                                    await process_new_message(msg, src_id, _entity_titles.get(src_id, str(src_id)))
+                        except Exception as e:
+                            logger.debug(f"Topic poll error for {src_id}/topic:{topic_id}: {e}")
+
+            topic_poll_task = asyncio.create_task(_topic_poller())
+        else:
+            logger.info("📡 No topic-specific routes, topic poller not needed")
+
         logger.info("=" * 60)
         logger.info("Bot is now running and listening for messages...")
         logger.info("Press Ctrl+C to stop")
         logger.info("=" * 60)
-        
+
         await client.run_until_disconnected()
         
     except KeyboardInterrupt:
@@ -1119,6 +1212,14 @@ async def main():
         logger.error(f"Fatal error: {e}")
         raise
     finally:
+        # Cancel topic poller task
+        if 'topic_poll_task' in locals() and topic_poll_task is not None:
+            topic_poll_task.cancel()
+            try:
+                await topic_poll_task
+            except asyncio.CancelledError:
+                pass
+
         # Cancel cleanup task
         if 'cleanup_task' in locals():
             cleanup_task.cancel()
