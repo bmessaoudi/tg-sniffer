@@ -29,6 +29,7 @@ class Route:
     destinations: List[int]      # Destination channel IDs
     topic_id: Optional[int]      # None = all messages, int = only that forum topic
     copy_media: bool = False     # True = forward media, False = text-only
+    copy_gif_only: bool = False  # True = forward only GIFs/stickers, skip everything else
 
 
 @dataclass
@@ -38,6 +39,7 @@ class ResolvedRoute:
     destinations: List[int]
     topic_id: Optional[int]
     copy_media: bool = False
+    copy_gif_only: bool = False
 
 
 # =============================================================================
@@ -231,9 +233,15 @@ def _parse_channel_routes(raw: str) -> List[Route]:
             logger.warning(f"Invalid route (empty source or destinations): {rule}")
             continue
 
+        # Parse +gif flag (must check before +media since +gif implies +media)
+        copy_gif_only = False
+        if '+gif' in source_part:
+            copy_gif_only = True
+            source_part = source_part.replace('+gif', '')
+
         # Parse +media flag
         copy_media = False
-        if '+media' in source_part:
+        if '+media' in source_part or copy_gif_only:
             copy_media = True
             source_part = source_part.replace('+media', '')
 
@@ -268,7 +276,7 @@ def _parse_channel_routes(raw: str) -> List[Route]:
             logger.warning(f"No valid destinations in route: {rule}")
             continue
 
-        routes.append(Route(source=source, destinations=destinations, topic_id=topic_id, copy_media=copy_media))
+        routes.append(Route(source=source, destinations=destinations, topic_id=topic_id, copy_media=copy_media, copy_gif_only=copy_gif_only))
 
     return routes
 
@@ -455,7 +463,7 @@ class DestinationQueue:
         self._client = client
         self._message_mapper = message_mapper
     
-    async def add_message(self, message, sender_title, preview, source_channel_id, reply_to_dest_id=None, copy_media=False):
+    async def add_message(self, message, sender_title, preview, source_channel_id, reply_to_dest_id=None, copy_media=False, copy_gif_only=False):
         """Add a message to the queue."""
         self.stats['total_received'] += 1
         await self.queue.put({
@@ -465,6 +473,7 @@ class DestinationQueue:
             'source_channel_id': source_channel_id,
             'reply_to_dest_id': reply_to_dest_id,
             'copy_media': copy_media,
+            'copy_gif_only': copy_gif_only,
             'timestamp': datetime.now(),
             'retries': 0,
         })
@@ -499,7 +508,22 @@ class DestinationQueue:
                 preview = item['preview']
                 reply_to_dest_id = item.get('reply_to_dest_id')
                 copy_media = item.get('copy_media', False)
+                copy_gif_only = item.get('copy_gif_only', False)
                 retries = item['retries']
+
+                # GIF-only mode: skip messages that are not GIFs or stickers
+                if copy_gif_only:
+                    doc = getattr(message, 'document', None) or getattr(getattr(message, 'media', None), 'document', None)
+                    is_gif_or_sticker = False
+                    if doc and hasattr(doc, 'attributes'):
+                        is_gif_or_sticker = any(
+                            isinstance(attr, (DocumentAttributeAnimated, DocumentAttributeSticker))
+                            for attr in doc.attributes
+                        )
+                    if not is_gif_or_sticker:
+                        logger.info(f"   ⏭️  Skipped non-GIF for '{self.validated_dest.title}'")
+                        self.queue.task_done()
+                        continue
 
                 # Text-only mode: skip media-only messages (no text content)
                 if not copy_media and not message.text:
@@ -660,7 +684,7 @@ class MessageQueueManager:
                 reply_to_dest_id=reply_to_dest_id
             )
 
-    async def route_message(self, message, sender_title, preview, source_channel_id, destination_ids: List[int], reply_to_dest_ids: Dict[int, int] = None, media_dest_ids: set = None):
+    async def route_message(self, message, sender_title, preview, source_channel_id, destination_ids: List[int], reply_to_dest_ids: Dict[int, int] = None, media_dest_ids: set = None, gif_only_dest_ids: set = None):
         """Add a message to specific destination queues (per-source routing)."""
         self.global_stats['total_received'] += 1
 
@@ -669,13 +693,15 @@ class MessageQueueManager:
             if queue:
                 reply_to_dest_id = reply_to_dest_ids.get(dest_id) if reply_to_dest_ids else None
                 copy_media = dest_id in media_dest_ids if media_dest_ids else False
+                copy_gif_only = dest_id in gif_only_dest_ids if gif_only_dest_ids else False
                 await queue.add_message(
                     message=message,
                     sender_title=sender_title,
                     preview=preview,
                     source_channel_id=source_channel_id,
                     reply_to_dest_id=reply_to_dest_id,
-                    copy_media=copy_media
+                    copy_media=copy_media,
+                    copy_gif_only=copy_gif_only
                 )
     
     async def start_workers(self):
@@ -895,7 +921,8 @@ async def main():
                 source_channel_id=src_id,
                 destinations=route.destinations,
                 topic_id=route.topic_id,
-                copy_media=route.copy_media
+                copy_media=route.copy_media,
+                copy_gif_only=route.copy_gif_only
             )
             routing_table.setdefault(src_id, []).append(resolved)
 
@@ -952,11 +979,14 @@ async def main():
             # Filter routes by topic: topic_id=None matches all, specific topic matches only that topic
             target_dest_ids = set()
             media_dest_ids = set()
+            gif_only_dest_ids = set()
             for resolved_route in source_routes:
                 if resolved_route.topic_id is None or resolved_route.topic_id == msg_topic_id:
                     target_dest_ids.update(resolved_route.destinations)
                     if resolved_route.copy_media:
                         media_dest_ids.update(resolved_route.destinations)
+                    if resolved_route.copy_gif_only:
+                        gif_only_dest_ids.update(resolved_route.destinations)
 
             if not target_dest_ids:
                 if msg_topic_id is not None:
@@ -1021,7 +1051,8 @@ async def main():
                 source_channel_id=source_channel_id,
                 destination_ids=list(target_dest_ids),
                 reply_to_dest_ids=reply_to_dest_ids,
-                media_dest_ids=media_dest_ids
+                media_dest_ids=media_dest_ids,
+                gif_only_dest_ids=gif_only_dest_ids
             )
             logger.info(f"   📤 Routed to {len(target_dest_ids)} destination(s)")
             logger.info(f"{'─' * 50}")
