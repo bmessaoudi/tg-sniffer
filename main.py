@@ -29,7 +29,7 @@ class Route:
     destinations: List[int]      # Destination channel IDs
     topic_id: Optional[int]      # None = all messages, int = only that forum topic
     copy_media: bool = False     # True = forward media, False = text-only
-    copy_gif_only: bool = False  # True = forward only GIFs/stickers, skip everything else
+    copy_gif_only: bool = False  # True = forward GIFs/stickers as media, non-GIF media sent as text-only
 
 
 @dataclass
@@ -511,8 +511,9 @@ class DestinationQueue:
                 copy_gif_only = item.get('copy_gif_only', False)
                 retries = item['retries']
 
-                # GIF-only mode: skip messages that are not GIFs or stickers
-                if copy_gif_only:
+                # GIF-only mode: GIFs/stickers are sent as media, other media
+                # is downgraded to text-only (or skipped if no text).
+                if copy_gif_only and message.media:
                     doc = getattr(message, 'document', None) or getattr(getattr(message, 'media', None), 'document', None)
                     is_gif_or_sticker = False
                     if doc and hasattr(doc, 'attributes'):
@@ -521,9 +522,13 @@ class DestinationQueue:
                             for attr in doc.attributes
                         )
                     if not is_gif_or_sticker:
-                        logger.info(f"   ⏭️  Skipped non-GIF for '{self.validated_dest.title}'")
-                        self.queue.task_done()
-                        continue
+                        # Non-GIF media: send text only, skip if media-only
+                        if not message.text:
+                            logger.info(f"   ⏭️  Skipped non-GIF media-only for '{self.validated_dest.title}'")
+                            self.queue.task_done()
+                            continue
+                        # Has text: downgrade to text-only send
+                        copy_media = False
 
                 # Text-only mode: skip media-only messages (no text content)
                 if not copy_media and not message.text:
